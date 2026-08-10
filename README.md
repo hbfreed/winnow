@@ -3,7 +3,7 @@
 Winnow scores and removes routed experts or expert channels from MoE models.
 It does not train the model after pruning.
 
-Winnow supports OLMoE and Qwen3.5 MoE text models.
+Winnow supports OLMoE and Qwen3.5 or Qwen3.6 MoE text models.
 
 Install the command with `uv`:
 

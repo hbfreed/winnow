@@ -61,15 +61,16 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _device(value: str) -> str:
-    if value != "auto":
-        return value
-    return "cuda:0" if torch.cuda.is_available() else "cpu"
+def _device_map(value: str) -> str | dict[str, str]:
+    if value == "auto":
+        return "auto"
+    return {"": value}
 
 
 def _dtype(value: str, device: str) -> torch.dtype:
     if value == "auto":
-        return torch.bfloat16 if device.startswith("cuda") else torch.float32
+        uses_cuda = device.startswith("cuda") or (device == "auto" and torch.cuda.is_available())
+        return torch.bfloat16 if uses_cuda else torch.float32
     return {
         "bfloat16": torch.bfloat16,
         "float16": torch.float16,
@@ -96,16 +97,16 @@ def _fingerprint(config) -> str:
 
 def run_prune(args: argparse.Namespace) -> Path:
     """Run one complete calibration and pruning job."""
-    device = _device(args.device)
-    dtype = _dtype(args.dtype, device)
+    dtype = _dtype(args.dtype, args.device)
     tokenizer = AutoTokenizer.from_pretrained(args.model, revision=args.model_revision)
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         revision=args.model_revision,
         dtype=dtype,
-        device_map={"": device},
+        device_map=_device_map(args.device),
     ).eval()
     adapter = adapter_for(model)
+    input_device = model.get_input_embeddings().weight.device
 
     batches = calibration_batches(
         tokenizer,
@@ -121,7 +122,7 @@ def run_prune(args: argparse.Namespace) -> Path:
     )
     with StatsCollector(model, adapter) as collector, torch.no_grad():
         for batch in batches:
-            model(input_ids=batch.to(device), use_cache=False)
+            model(input_ids=batch.to(input_device), use_cache=False)
 
     layer_indices = tuple(index for index, _block in adapter.layers)
     if args.strategy == "winnow":
@@ -167,6 +168,9 @@ def run_prune(args: argparse.Namespace) -> Path:
             else "mean(normalized_topk_router_weight * ungated_expert_output_l2)"
         ),
         "dtype": str(dtype).removeprefix("torch."),
+        "device_map": {
+            key: str(value) for key, value in getattr(model, "hf_device_map", {}).items()
+        },
         "torch_version": torch.__version__,
         "transformers_version": transformers.__version__,
     }
