@@ -1,0 +1,50 @@
+[project]
+name = "moe-winnow"
+version = "0.1.0"
+description = "One-shot expert and channel pruning for Mixture-of-Experts models"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [{ name = "Henry Freed" }]
+license-files = ["LICENSE"]
+dependencies = [
+    "accelerate>=1.12,<2",
+    "datasets>=4,<6",
+    "huggingface-hub>=0.36,<2",
+    "safetensors>=0.5,<1",
+    "torch>=2.11,<2.13",
+    "transformers==5.13.1",
+]
+
+[project.optional-dependencies]
+fast = [
+    "megablocks @ git+https://github.com/hbfreed/megablocks-variable.git@c6faf01db806f2f9c790ac37c9a2a5f8b5ee893d",
+]
+dev = [
+    "build>=1.3,<2",
+    "pytest>=8,<10",
+    "ruff>=0.12,<1",
+]
+
+[project.scripts]
+winnow = "winnow.cli:main"
+
+[project.urls]
+Repository = "https://github.com/hbfreed/winnow"
+Issues = "https://github.com/hbfreed/winnow/issues"
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/winnow"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100

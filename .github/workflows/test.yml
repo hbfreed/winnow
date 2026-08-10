@@ -1,0 +1,29 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@v6.0.2
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+      - name: Install Winnow
+        run: uv sync --locked --extra dev
+      - name: Check the source
+        run: |
+          uv run ruff format --check .
+          uv run ruff check .
+      - name: Run the tests
+        run: uv run pytest -q
+      - name: Build the package
+        run: uv build
