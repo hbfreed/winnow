@@ -49,14 +49,25 @@ def calibration_batches(
         stream = stream.select_columns([text_field])
     stream = stream.shuffle(seed=seed, buffer_size=10_000)
 
+    def _encoded() -> Iterator[list[int]]:
+        # Fast tokenizers only parallelize across a batch; per-document calls
+        # would keep the whole calibration set single-core.
+        texts: list[str] = []
+        for example in stream:
+            if text_field not in example:
+                raise ValueError(f"dataset rows do not contain the field {text_field!r}")
+            texts.append(str(example[text_field]))
+            if len(texts) == 64:
+                yield from tokenizer(texts, add_special_tokens=False)["input_ids"]
+                texts = []
+        if texts:
+            yield from tokenizer(texts, add_special_tokens=False)["input_ids"]
+
     token_buffer: list[int] = []
     rows: list[torch.Tensor] = []
     produced = 0
     eos = int(tokenizer.eos_token_id)
-    for example in stream:
-        if text_field not in example:
-            raise ValueError(f"dataset rows do not contain the field {text_field!r}")
-        token_ids = tokenizer(str(example[text_field]), add_special_tokens=False)["input_ids"]
+    for token_ids in _encoded():
         if not token_ids:
             continue
         token_buffer.extend(token_ids)

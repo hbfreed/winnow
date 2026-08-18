@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -131,20 +132,31 @@ def _sparse_positions(config) -> dict[int, int]:
     return positions
 
 
+def _layer_name_groups(names: list[str]) -> dict[int, list[str]]:
+    """Group tensor names by decoder layer index, once per sweep."""
+    groups: dict[int, list[str]] = {}
+    for name in names:
+        match = re.match(r"model\.layers\.(\d+)\.", name)
+        if match:
+            groups.setdefault(int(match.group(1)), []).append(name)
+    return groups
+
+
 def _map_layer_state(
     config,
     layer_idx: int,
     reader: ShardReader,
     device: str,
     dtype: torch.dtype,
+    names: list[str] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Build one decoder layer's state dict, fusing per-expert shards if needed."""
     prefix = f"model.layers.{layer_idx}."
+    if names is None:
+        names = [name for name in reader.names if name.startswith(prefix)]
     state: dict[str, torch.Tensor] = {}
     expert_parts: dict[int, dict[str, torch.Tensor]] = {}
-    for name in reader.names:
-        if not name.startswith(prefix):
-            continue
+    for name in names:
         local = name.removeprefix(prefix)
         # Poolside checkpoints predate the native module: shared expert is
         # singular and the routing bias lives on the experts module.
@@ -156,22 +168,24 @@ def _map_layer_state(
         parts = target.split(".")
         if len(parts) >= 4 and parts[0] == "mlp" and parts[1] == "experts" and parts[2].isdigit():
             expert = int(parts[2])
-            expert_parts.setdefault(expert, {})[parts[3]] = reader.get(name, device).to(dtype)
+            expert_parts.setdefault(expert, {})[parts[3]] = reader.get(name).to(dtype)
             continue
         state[target] = reader.get(name, device).to(dtype)
 
     if expert_parts:
+        # Pack the per-expert shards on CPU and move each fused tensor in one
+        # transfer; hundreds of small host-to-device copies serialize layer load.
         experts = len(expert_parts)
         width = expert_parts[0]["gate_proj"].shape[0]
         hidden = expert_parts[0]["gate_proj"].shape[1]
-        gate_up = torch.empty(experts, 2 * width, hidden, device=device, dtype=dtype)
-        down = torch.empty(experts, hidden, width, device=device, dtype=dtype)
+        gate_up = torch.empty(experts, 2 * width, hidden, dtype=dtype)
+        down = torch.empty(experts, hidden, width, dtype=dtype)
         for expert, parts_dict in expert_parts.items():
             gate_up[expert, :width] = parts_dict["gate_proj"]
             gate_up[expert, width:] = parts_dict["up_proj"]
             down[expert] = parts_dict["down_proj"]
-        state["mlp.experts.gate_up_proj"] = gate_up
-        state["mlp.experts.down_proj"] = down
+        state["mlp.experts.gate_up_proj"] = gate_up.to(device)
+        state["mlp.experts.down_proj"] = down.to(device)
     return state
 
 
@@ -181,6 +195,7 @@ def materialize_layer(
     reader: ShardReader,
     device: str,
     dtype: torch.dtype,
+    names: list[str] | None = None,
 ) -> nn.Module:
     """Load one decoder layer's weights onto ``device`` and return the module."""
     from transformers.models.laguna.modeling_laguna import LagunaDecoderLayer
@@ -195,7 +210,7 @@ def materialize_layer(
         widths = widths_table[_sparse_positions(config)[layer_idx]]
         install_ragged_experts(layer.mlp, list(widths), config.hidden_size, config.hidden_act)
 
-    state = _map_layer_state(config, layer_idx, reader, device, dtype)
+    state = _map_layer_state(config, layer_idx, reader, device, dtype, names)
     layer.load_state_dict(state, strict=True, assign=True)
     return layer.eval()
 
@@ -325,10 +340,13 @@ def run_rank_sweep(
     ]
 
     inputs_cache: dict[int, tuple] = {}
+    layer_names = _layer_name_groups(reader.names)
 
     with torch.no_grad():
         for layer_idx in range(config.num_hidden_layers):
-            layer = materialize_layer(config, layer_idx, reader, device, dtype)
+            layer = materialize_layer(
+                config, layer_idx, reader, device, dtype, layer_names.get(layer_idx)
+            )
             layer_type = config.layer_types[layer_idx]
             handles = []
             if collector is not None and layer_idx in positions:
@@ -352,9 +370,9 @@ def run_rank_sweep(
                 target[start:stop].copy_(out)
             for handle in handles:
                 handle.remove()
+            # No empty_cache here: consecutive layers allocate the same shapes,
+            # so the caching allocator reuses the freed blocks directly.
             del layer
-            if device.startswith("cuda"):
-                torch.cuda.empty_cache()
             source, target = target, source
 
         # Final norm + lm_head: cross-entropy on the held-out sequences.
@@ -377,16 +395,15 @@ def run_rank_sweep(
                     continue
                 lo = max(start, calib)
                 hidden = source[lo:stop].to(device=device, dtype=dtype)
-                # The last position has no label; skip it before the vocab matmul.
-                logits = F.linear(norm(hidden[:, :-1]), lm_head).float()
                 labels = token_ids[lo:stop].to(device).long()
-                loss = F.cross_entropy(
-                    logits.flatten(0, 1),
-                    labels[:, 1:].flatten(),
-                    reduction="sum",
-                )
-                loss_sum += float(loss)
-                loss_tokens += labels[:, 1:].numel()
+                # One sequence at a time keeps the full-vocab logits (and their
+                # float32 copy) to one [sequence, vocab] tensor; the last
+                # position has no label, so it skips the matmul entirely.
+                for row_hidden, row_labels in zip(hidden, labels):
+                    logits = F.linear(norm(row_hidden[:-1]), lm_head).float()
+                    loss = F.cross_entropy(logits, row_labels[1:], reduction="sum")
+                    loss_sum += float(loss)
+                    loss_tokens += row_labels[1:].numel()
 
     reader.close()
     stats = collector.stats if collector is not None else None
