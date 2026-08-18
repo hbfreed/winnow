@@ -8,6 +8,41 @@ from torch import nn
 from transformers.activations import ACT2FN
 
 
+def routed_token_segments(
+    top_k_index: torch.Tensor,
+    num_experts: int,
+    keep_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, list[tuple[int, torch.Tensor, torch.Tensor]]]:
+    """Group routed (token, slot) pairs by expert with a single host sync.
+
+    Returns ``(counts, segments)`` where ``counts`` is the on-device per-expert
+    routed-token count and ``segments`` yields ``(expert, tokens, slots)`` for
+    every expert that received tokens.  ``keep_mask`` optionally drops padded
+    tokens (shape ``[tokens]``) before grouping.  The per-expert ``torch.where``
+    alternative launches one synchronizing kernel per expert, which dominates
+    wall-clock for many-expert models.
+    """
+    top_k = int(top_k_index.shape[1])
+    flat = top_k_index.reshape(-1)
+    positions = None
+    if keep_mask is not None:
+        valid = keep_mask.to(flat.device).repeat_interleave(top_k)
+        positions = valid.nonzero(as_tuple=False).flatten()
+        flat = flat[positions]
+    order = torch.argsort(flat, stable=True)
+    if positions is not None:
+        order = positions[order]
+    counts = torch.bincount(flat, minlength=num_experts)
+    segments = []
+    offset = 0
+    for expert, count in enumerate(counts.tolist()):  # the one host sync
+        if count:
+            segment = order[offset : offset + count]
+            segments.append((expert, segment // top_k, segment % top_k))
+        offset += count
+    return counts, segments
+
+
 def install_ragged_experts(
     block: nn.Module, widths: list[int], hidden_size: int, hidden_act: str
 ) -> None:
@@ -59,12 +94,8 @@ class RaggedExperts(nn.Module):
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
         output = torch.zeros_like(hidden_states)
-        with torch.no_grad():
-            mask = F.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
-            hit = (mask.sum(dim=(-1, -2)) > 0).nonzero(as_tuple=False).flatten()
-        for expert_tensor in hit:
-            expert = int(expert_tensor)
-            slots, tokens = torch.where(mask[expert])
+        _counts, segments = routed_token_segments(top_k_index, self.num_experts)
+        for expert, tokens, slots in segments:
             current = hidden_states[tokens]
             gate, up = F.linear(current, self.gate_up_projs[expert]).chunk(2, dim=-1)
             current = self.act_fn(gate) * up

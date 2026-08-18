@@ -10,6 +10,7 @@ from torch import nn
 from torch.utils.hooks import RemovableHandle
 
 from .adapters import ModelAdapter, adapter_for
+from .runtime.ragged import routed_token_segments
 
 
 class StatsCollector:
@@ -121,23 +122,11 @@ class StatsCollector:
             normalized_weights /= normalized_weights.sum(dim=-1, keepdim=True)
         indices = indices.to(device)
 
-        counts = torch.zeros(experts, dtype=torch.int64)
         reap = torch.zeros(experts, dtype=torch.float32, device=device)
         channels = torch.zeros(experts, width, dtype=torch.float32, device=device)
-        expert_mask = F.one_hot(indices, num_classes=experts).permute(2, 1, 0)
-        hit = (expert_mask.sum(dim=(-1, -2)) > 0).nonzero(as_tuple=False).flatten()
+        counts, segments = routed_token_segments(indices, experts, keep_mask=mask_device)
         with torch.no_grad():
-            for expert_tensor in hit:
-                expert = int(expert_tensor)
-                slots, tokens = torch.where(expert_mask[expert])
-                if mask_device is not None:
-                    keep = mask_device[tokens]
-                    slots = slots[keep]
-                    tokens = tokens[keep]
-                routed = int(tokens.numel())
-                counts[expert] = routed
-                if routed == 0:
-                    continue
+            for expert, tokens, slots in segments:
                 gate, up = F.linear(hidden_states[tokens], gate_up[expert]).chunk(2, dim=-1)
                 activation = experts_module.act_fn(gate) * up
                 output = F.linear(activation, down[expert])
@@ -147,7 +136,7 @@ class StatsCollector:
                     actual_weights[tokens, slots, None] * activation.abs().float()
                 ).sum(dim=0)
 
-            self.stats["token_count"][position] += counts
+            self.stats["token_count"][position] += counts.cpu()
             self.stats["reap_sum"][position] += reap.cpu()
             self.stats["channel_sum"][position] += channels.cpu()
             if not bool(self.stats["down_norm"][position].any()):
