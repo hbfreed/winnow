@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import torch
-from torch import nn
 from transformers.models.olmoe.configuration_olmoe import OlmoeConfig
 from transformers.models.olmoe.modeling_olmoe import OlmoeForCausalLM
 
-from .ragged import RaggedExperts
+from .ragged import install_ragged_experts
 
 
 class WinnowOlmoeConfig(OlmoeConfig):
@@ -39,22 +37,7 @@ class WinnowOlmoeForCausalLM(OlmoeForCausalLM):
         if len(widths_table) != len(self.model.layers):
             raise ValueError("expert_widths must contain one row for each decoder layer")
         for layer, widths in zip(self.model.layers, widths_table, strict=True):
-            block = layer.mlp
-            if len(widths) < block.gate.top_k:
-                raise ValueError("each layer must keep at least the router top-k experts")
-            if any(width <= 0 for width in widths):
-                raise ValueError("expert widths must be greater than 0")
-            old_weight = block.gate.weight
-            block.gate.num_experts = len(widths)
-            block.gate.weight = nn.Parameter(
-                torch.empty(
-                    len(widths),
-                    config.hidden_size,
-                    dtype=old_weight.dtype,
-                    device=old_weight.device,
-                )
-            )
-            block.experts = RaggedExperts(config.hidden_size, list(widths), config.hidden_act)
+            install_ragged_experts(layer.mlp, list(widths), config.hidden_size, config.hidden_act)
 
 
 __all__ = ["WinnowOlmoeConfig", "WinnowOlmoeForCausalLM"]

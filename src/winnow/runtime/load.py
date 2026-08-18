@@ -57,7 +57,7 @@ def load_fast_laguna(
     """Build a pruned Laguna model on the fused runtime, ready to generate."""
     from accelerate import dispatch_model, init_empty_weights
 
-    from ..stream import ShardReader, load_config, _sparse_positions
+    from ..stream import ShardReader, _sparse_positions, load_config
     from .fast import FastLagunaMoE
     from .laguna import WinnowLagunaForCausalLM
 
@@ -85,8 +85,8 @@ def load_fast_laguna(
             widths,
             config.num_experts_per_tok,
             float(getattr(config, "moe_routed_scaling_factor", 1.0)),
+            dtype=dtype,
         )
-        fast = fast.to(dtype)
         with torch.no_grad():
             fast.gate.weight = nn.Parameter(
                 reader.get(f"model.layers.{layer_idx}.mlp.gate.weight").to(dtype),

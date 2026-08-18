@@ -17,6 +17,9 @@ class ModelAdapter:
     original_experts: int
     original_width: int
     top_k: int
+    # Sigmoid routers (Laguna, DeepSeek-style gates) return normalized top-k
+    # weights directly; softmax routers need the weights recovered from logits.
+    sigmoid_router: bool = False
 
 
 def _layer_index(name: str) -> int:
@@ -77,4 +80,4 @@ def adapter_for(model: nn.Module) -> ModelAdapter:
             raise ValueError(f"layer {layer_index} has an inconsistent down projection")
         if int(block.gate.top_k) != top_k:
             raise ValueError(f"layer {layer_index} has a different router top-k")
-    return ModelAdapter(family, layers, experts, width, top_k)
+    return ModelAdapter(family, layers, experts, width, top_k, sigmoid_router=family == "laguna")

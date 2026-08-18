@@ -30,7 +30,6 @@ class StatsCollector:
             "channel_sum": torch.zeros(layers, experts, width, dtype=torch.float32),
             "down_norm": torch.zeros(layers, experts, width, dtype=torch.float32),
             "layer_indices": tuple(index for index, _block in self.adapter.layers),
-            "family": self.adapter.family,
         }
         self._handles: list[RemovableHandle] = []
         self._mask: torch.Tensor | None = None
@@ -111,10 +110,10 @@ class StatsCollector:
         device = hidden_states.device
         mask_device = None if mask is None else mask.to(device)
         actual_weights = actual_weights.to(device=device, dtype=torch.float32)
-        if self.adapter.family == "laguna":
-            # Laguna routes with sigmoid scores, so a softmax over its logits is
-            # meaningless; the gate's returned weights are already the normalized
-            # top-k routing weights (renormalize to stay exact under float32).
+        if self.adapter.sigmoid_router:
+            # A softmax over sigmoid-router logits is meaningless; the gate's
+            # returned weights are already the normalized top-k routing weights
+            # (renormalize to stay exact under float32).
             normalized_weights = actual_weights / actual_weights.sum(dim=-1, keepdim=True)
         else:
             probabilities = F.softmax(router_logits.to(device), dim=-1, dtype=torch.float32)

@@ -1,5 +1,6 @@
 import math
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -59,7 +60,7 @@ def test_stream_matches_full_forward(tmp_path, tiny_laguna):
         rtol=1e-4,
         atol=1e-5,
     )
-    assert result["perplexity"] == __import__("pytest").approx(expected_ppl, rel=1e-3)
+    assert result["perplexity"] == pytest.approx(expected_ppl, rel=1e-3)
 
 
 def test_stream_pruned_checkpoint_perplexity(tmp_path, tiny_laguna):
@@ -81,7 +82,7 @@ def test_stream_pruned_checkpoint_perplexity(tmp_path, tiny_laguna):
     }
     base = stream_run(source_dir, sequences, workdir=tmp_path / "work_base", **kwargs)
     pruned = stream_run(pruned_dir, sequences, workdir=tmp_path / "work_pruned", **kwargs)
-    assert pruned["perplexity"] == __import__("pytest").approx(base["perplexity"], rel=1e-4)
+    assert pruned["perplexity"] == pytest.approx(base["perplexity"], rel=1e-4)
 
 
 def test_streamed_writer_matches_in_memory_writer(tmp_path, tiny_laguna, input_ids):

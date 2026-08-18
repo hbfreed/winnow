@@ -13,7 +13,14 @@ class FastRaggedMoE(nn.Module):
 
     block_size = 128
 
-    def __init__(self, hidden_size: int, widths: list[int], top_k: int) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        widths: list[int],
+        top_k: int,
+        *,
+        dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
         if any(width <= 0 or width % self.block_size for width in widths):
             raise ValueError("expert widths must be positive multiples of 128")
@@ -24,10 +31,10 @@ class FastRaggedMoE(nn.Module):
         self.num_experts = len(widths)
         self.top_k = int(top_k)
         self.total_width = sum(self.expert_widths)
-        self.gate = nn.Linear(hidden_size, self.num_experts, bias=False)
-        self.w_gate = nn.Parameter(torch.empty(hidden_size, self.total_width))
-        self.w_up = nn.Parameter(torch.empty(hidden_size, self.total_width))
-        self.w_down = nn.Parameter(torch.empty(self.total_width, hidden_size))
+        self.gate = nn.Linear(hidden_size, self.num_experts, bias=False, dtype=dtype)
+        self.w_gate = nn.Parameter(torch.empty(hidden_size, self.total_width, dtype=dtype))
+        self.w_up = nn.Parameter(torch.empty(hidden_size, self.total_width, dtype=dtype))
+        self.w_down = nn.Parameter(torch.empty(self.total_width, hidden_size, dtype=dtype))
         self._plan_cache: FusedMoEPlan | None = None
 
     def _offset(self, expert: int) -> int:
@@ -218,8 +225,10 @@ class FastLagunaMoE(FastRaggedMoE):
         widths: list[int],
         top_k: int,
         routed_scaling_factor: float = 1.0,
+        *,
+        dtype: torch.dtype | None = None,
     ) -> None:
-        super().__init__(hidden_size, widths, top_k)
+        super().__init__(hidden_size, widths, top_k, dtype=dtype)
         self.routed_scaling_factor = float(routed_scaling_factor)
         self.e_score_correction_bias = nn.Parameter(
             torch.zeros(len(widths)), requires_grad=False

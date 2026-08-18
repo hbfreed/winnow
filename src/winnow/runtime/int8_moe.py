@@ -22,7 +22,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-
 from megablocks.backend import kernels
 from megablocks.backend.fused_moe import (
     _count_experts,

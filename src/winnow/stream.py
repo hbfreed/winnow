@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -49,10 +48,18 @@ def load_config(checkpoint: str | Path):
     model_type = None
     if config_file.exists():
         model_type = json.loads(config_file.read_text()).get("model_type")
-    if model_type == "winnow_laguna":
-        from .runtime.laguna import WinnowLagunaConfig
+    if model_type and model_type.startswith("winnow_"):
+        from . import runtime
 
-        config = WinnowLagunaConfig.from_pretrained(checkpoint)
+        by_model_type = {
+            cls.model_type: cls
+            for cls in (
+                runtime.WinnowLagunaConfig,
+                runtime.WinnowOlmoeConfig,
+                runtime.WinnowQwen3_5MoeConfig,
+            )
+        }
+        config = by_model_type[model_type].from_pretrained(checkpoint)
     else:
         config = AutoConfig.from_pretrained(checkpoint)
     config._attn_implementation = "sdpa"
@@ -75,7 +82,7 @@ def _tensor_index(checkpoint: Path) -> dict[str, Path]:
     from safetensors import safe_open
 
     with safe_open(single, framework="pt") as handle:
-        return {name: single for name in handle.keys()}
+        return {name: single for name in handle.keys()}  # noqa: SIM118 — safe_open is not a dict
 
 
 class ShardReader:
@@ -90,7 +97,7 @@ class ShardReader:
     def names(self) -> list[str]:
         return list(self.index)
 
-    def get(self, name: str, device: str = "cpu") -> torch.Tensor:
+    def _handle(self, name: str):
         from safetensors import safe_open
 
         file = self.index[name]
@@ -98,7 +105,14 @@ class ShardReader:
         if handle is None:
             handle = safe_open(file, framework="pt")
             self._handles[file] = handle
-        return handle.get_tensor(name).to(device)
+        return handle
+
+    def get(self, name: str, device: str = "cpu") -> torch.Tensor:
+        return self._handle(name).get_tensor(name).to(device)
+
+    def get_slice(self, name: str):
+        """Return a lazy slice for one tensor; indexing it reads only that part."""
+        return self._handle(name).get_slice(name)
 
     def close(self) -> None:
         self._handles.clear()
@@ -176,20 +190,10 @@ def materialize_layer(
 
     widths_table = getattr(config, "expert_widths", None)
     if widths_table is not None and hasattr(layer.mlp, "experts"):
-        from .runtime.ragged import RaggedExperts
+        from .runtime.ragged import install_ragged_experts
 
-        position = _sparse_positions(config)[layer_idx]
-        widths = widths_table[position]
-        gate = layer.mlp.gate
-        gate.num_experts = len(widths)
-        with torch.device("meta"):
-            gate.weight = nn.Parameter(torch.empty(len(widths), config.hidden_size))
-            gate.e_score_correction_bias = nn.Parameter(
-                torch.empty(len(widths)), requires_grad=False
-            )
-            layer.mlp.experts = RaggedExperts(
-                config.hidden_size, list(widths), config.hidden_act
-            )
+        widths = widths_table[_sparse_positions(config)[layer_idx]]
+        install_ragged_experts(layer.mlp, list(widths), config.hidden_size, config.hidden_act)
 
     state = _map_layer_state(config, layer_idx, reader, device, dtype)
     layer.load_state_dict(state, strict=True, assign=True)
@@ -306,6 +310,7 @@ def run_rank_sweep(
             original_experts=config.num_experts,
             original_width=config.moe_intermediate_size,
             top_k=config.num_experts_per_tok,
+            sigmoid_router=True,
         )
         collector = StatsCollector(None, adapter)
 
@@ -344,7 +349,7 @@ def run_rank_sweep(
                     attention_mask=masks[layer_type],
                     position_embeddings=position_embeddings[layer_type],
                 )
-                target[start:stop] = out.cpu()
+                target[start:stop].copy_(out)
             for handle in handles:
                 handle.remove()
             del layer
@@ -372,10 +377,11 @@ def run_rank_sweep(
                     continue
                 lo = max(start, calib)
                 hidden = source[lo:stop].to(device=device, dtype=dtype)
-                logits = F.linear(norm(hidden), lm_head).float()
+                # The last position has no label; skip it before the vocab matmul.
+                logits = F.linear(norm(hidden[:, :-1]), lm_head).float()
                 labels = token_ids[lo:stop].to(device).long()
                 loss = F.cross_entropy(
-                    logits[:, :-1].flatten(0, 1),
+                    logits.flatten(0, 1),
                     labels[:, 1:].flatten(),
                     reduction="sum",
                 )
@@ -402,16 +408,17 @@ def _write_rank_shards(
     """Embed all sequences on CPU and split them into per-rank buffers."""
     config = load_config(checkpoint)
     reader = ShardReader(checkpoint)
-    embeddings = reader.get("model.embed_tokens.weight").to(torch.float32)
+    embeddings = reader.get("model.embed_tokens.weight")
     reader.close()
 
     eval_sequences = sequences.shape[0] - calibration_sequences
-    calib_split = [len(part) for part in torch.arange(calibration_sequences).chunk(ranks)]
-    eval_split = [len(part) for part in torch.arange(eval_sequences).chunk(ranks)]
-    while len(calib_split) < ranks:
-        calib_split.append(0)
-    while len(eval_split) < ranks:
-        eval_split.append(0)
+
+    def _split(total: int) -> list[int]:
+        base, extra = divmod(total, ranks)
+        return [base + (rank < extra) for rank in range(ranks)]
+
+    calib_split = _split(calibration_sequences)
+    eval_split = _split(eval_sequences)
 
     rank_data = []
     calib_start = 0
@@ -448,12 +455,7 @@ def _write_rank_shards(
 
 def _spawn_worker(rank: int, rank_data: list[RankData], checkpoint: str, kwargs: dict) -> None:
     result = run_rank_sweep(rank_data[rank], checkpoint, device=f"cuda:{rank}", **kwargs)
-    payload = {
-        "stats": result["stats"],
-        "loss_sum": result["loss_sum"],
-        "loss_tokens": result["loss_tokens"],
-    }
-    torch.save(payload, rank_data[rank].directory / "result.pt")
+    torch.save(result, rank_data[rank].directory / "result.pt")
 
 
 def merge_stats(parts: list[dict]) -> dict:

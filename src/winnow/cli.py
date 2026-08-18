@@ -32,26 +32,41 @@ def _keep(value: str) -> float:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
+def _add_dataset_args(parser: argparse.ArgumentParser, *, sequences: int) -> None:
+    parser.add_argument("--calibration", required=True, help="Hugging Face dataset slug")
+    parser.add_argument("--dataset-config")
+    parser.add_argument("--split", default="train")
+    parser.add_argument("--text-field", default="text")
+    parser.add_argument("--dataset-revision")
+    parser.add_argument("--sequences", type=int, default=sequences)
+    parser.add_argument("--sequence-length", type=int, default=2048)
+    parser.add_argument("--seed", type=int, default=0)
+
+
+def _add_prune_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--keep", required=True, type=_keep, help="decimal fraction to keep")
+    parser.add_argument("--output", required=True, type=Path, help="output checkpoint path")
+    parser.add_argument("--strategy", choices=("winnow", "reap"), default="winnow")
+    parser.add_argument("--block-size", type=int, default=128)
+
+
+def _add_stream_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--chunk-sequences", type=int, default=4)
+    parser.add_argument("--ranks", type=int, default=0, help="0 = one per GPU")
+    parser.add_argument("--workdir", type=Path, help="residual buffer directory")
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the public command parser."""
     parser = argparse.ArgumentParser(prog="winnow")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
     prune = subparsers.add_parser("prune", help="score and prune a supported MoE model")
     prune.add_argument("model", help="Hugging Face model slug or local checkpoint")
-    prune.add_argument("--keep", required=True, type=_keep, help="decimal fraction to keep")
-    prune.add_argument("--calibration", required=True, help="Hugging Face dataset slug")
-    prune.add_argument("--output", required=True, type=Path, help="output checkpoint path")
-    prune.add_argument("--strategy", choices=("winnow", "reap"), default="winnow")
-    prune.add_argument("--dataset-config")
-    prune.add_argument("--split", default="train")
-    prune.add_argument("--text-field", default="text")
+    _add_prune_args(prune)
+    _add_dataset_args(prune, sequences=128)
     prune.add_argument("--model-revision")
-    prune.add_argument("--dataset-revision")
-    prune.add_argument("--sequences", type=int, default=128)
-    prune.add_argument("--sequence-length", type=int, default=2048)
     prune.add_argument("--batch-size", type=int, default=1)
-    prune.add_argument("--seed", type=int, default=0)
-    prune.add_argument("--block-size", type=int, default=128)
     prune.add_argument("--device", default="auto")
     prune.add_argument(
         "--dtype",
@@ -72,40 +87,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="score and prune a model too large to load, one layer at a time",
     )
     stream_prune.add_argument("model", help="Hugging Face model slug or local checkpoint")
-    stream_prune.add_argument("--keep", required=True, type=_keep)
-    stream_prune.add_argument("--calibration", required=True)
-    stream_prune.add_argument("--output", required=True, type=Path)
-    stream_prune.add_argument("--strategy", choices=("winnow", "reap"), default="winnow")
-    stream_prune.add_argument("--dataset-config")
-    stream_prune.add_argument("--split", default="train")
-    stream_prune.add_argument("--text-field", default="text")
-    stream_prune.add_argument("--dataset-revision")
-    stream_prune.add_argument("--sequences", type=int, default=1024)
+    _add_prune_args(stream_prune)
+    _add_dataset_args(stream_prune, sequences=1024)
     stream_prune.add_argument("--eval-sequences", type=int, default=64)
-    stream_prune.add_argument("--sequence-length", type=int, default=2048)
-    stream_prune.add_argument("--chunk-sequences", type=int, default=4)
-    stream_prune.add_argument("--seed", type=int, default=0)
-    stream_prune.add_argument("--block-size", type=int, default=128)
-    stream_prune.add_argument("--ranks", type=int, default=0, help="0 = one per GPU")
-    stream_prune.add_argument("--workdir", type=Path, help="residual buffer directory")
+    _add_stream_args(stream_prune)
 
     stream_eval = subparsers.add_parser(
         "stream-eval",
         help="held-out perplexity of a checkpoint too large to load",
     )
     stream_eval.add_argument("model", help="model slug or (pruned) local checkpoint")
-    stream_eval.add_argument("--calibration", required=True, help="evaluation dataset slug")
-    stream_eval.add_argument("--dataset-config")
-    stream_eval.add_argument("--split", default="train")
-    stream_eval.add_argument("--text-field", default="text")
-    stream_eval.add_argument("--dataset-revision")
-    stream_eval.add_argument("--sequences", type=int, default=64)
-    stream_eval.add_argument("--sequence-length", type=int, default=2048)
-    stream_eval.add_argument("--chunk-sequences", type=int, default=4)
+    _add_dataset_args(stream_eval, sequences=64)
     stream_eval.add_argument("--skip-sequences", type=int, default=0)
-    stream_eval.add_argument("--seed", type=int, default=0)
-    stream_eval.add_argument("--ranks", type=int, default=0, help="0 = one per GPU")
-    stream_eval.add_argument("--workdir", type=Path, help="residual buffer directory")
+    _add_stream_args(stream_eval)
     return parser
 
 
@@ -143,12 +137,71 @@ def _fingerprint(config) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+_SCORE_FORMULAS = {
+    "winnow": "mean(actual_router_weight * abs(post_swiglu_activation) * down_column_l2)",
+    "reap": "mean(normalized_topk_router_weight * ungated_expert_output_l2)",
+}
+
+
+def _build_plan(stats, args: argparse.Namespace, *, top_k: int, original_width: int):
+    """Select the pruning plan for one strategy from collected statistics."""
+    if args.strategy == "winnow":
+        return select_channels(
+            channel_scores(stats),
+            args.keep,
+            top_k=top_k,
+            block_size=args.block_size,
+            layer_indices=stats["layer_indices"],
+        )
+    return select_experts(
+        reap_scores(stats),
+        args.keep,
+        top_k=top_k,
+        original_width=original_width,
+        layer_indices=stats["layer_indices"],
+    )
+
+
+def _base_metadata(
+    args: argparse.Namespace,
+    *,
+    config_fingerprint: str,
+    tokens: int,
+    revision: str | None = None,
+    **calibration_extra,
+) -> dict:
+    """Provenance shared by both prune commands; callers add their own keys."""
+    return {
+        "winnow_version": __version__,
+        "source_model": args.model,
+        "source_commit": _hub_sha("model", args.model, revision),
+        "source_config_sha256": config_fingerprint,
+        "calibration": {
+            "dataset": args.calibration,
+            "config": args.dataset_config,
+            "split": args.split,
+            "text_field": args.text_field,
+            "revision": args.dataset_revision,
+            "commit": _hub_sha("dataset", args.calibration, args.dataset_revision),
+            "sequences": args.sequences,
+            "sequence_length": args.sequence_length,
+            "tokens": tokens,
+            "seed": args.seed,
+            "packing": "EOS-separated contiguous blocks",
+            **calibration_extra,
+        },
+        "score": _SCORE_FORMULAS[args.strategy],
+        "torch_version": torch.__version__,
+        "transformers_version": transformers.__version__,
+    }
+
+
 def run_prune(args: argparse.Namespace) -> Path:
     """Run one complete calibration and pruning job."""
     dtype = _dtype(args.dtype, args.device)
     tokenizer = _load_tokenizer(args.model, revision=args.model_revision)
     load_kwargs = {}
-    if getattr(args, "max_gpu_memory", None) and args.device == "auto":
+    if args.max_gpu_memory and args.device == "auto":
         load_kwargs["max_memory"] = {
             index: args.max_gpu_memory for index in range(torch.cuda.device_count())
         }
@@ -185,56 +238,25 @@ def run_prune(args: argparse.Namespace) -> Path:
         for batch in batches:
             model(input_ids=batch.to(input_device), use_cache=False)
 
-    layer_indices = tuple(index for index, _block in adapter.layers)
-    if args.strategy == "winnow":
-        plan = select_channels(
-            channel_scores(collector.stats),
-            args.keep,
-            top_k=adapter.top_k,
-            block_size=args.block_size,
-            layer_indices=layer_indices,
-        )
-    else:
-        plan = select_experts(
-            reap_scores(collector.stats),
-            args.keep,
-            top_k=adapter.top_k,
-            original_width=adapter.original_width,
-            layer_indices=layer_indices,
-        )
-
-    metadata = {
-        "winnow_version": __version__,
-        "source_model": args.model,
-        "source_revision": args.model_revision,
-        "source_commit": _hub_sha("model", args.model, args.model_revision),
-        "source_config_sha256": _fingerprint(model.config),
-        "calibration": {
-            "dataset": args.calibration,
-            "config": args.dataset_config,
-            "split": args.split,
-            "text_field": args.text_field,
-            "revision": args.dataset_revision,
-            "commit": _hub_sha("dataset", args.calibration, args.dataset_revision),
-            "sequences": args.sequences,
-            "sequence_length": args.sequence_length,
-            "tokens": collector.stats["n_tokens"],
-            "batch_size": args.batch_size,
-            "seed": args.seed,
-            "packing": "EOS-separated contiguous blocks",
-        },
-        "score": (
-            "mean(actual_router_weight * abs(post_swiglu_activation) * down_column_l2)"
-            if args.strategy == "winnow"
-            else "mean(normalized_topk_router_weight * ungated_expert_output_l2)"
-        ),
-        "dtype": str(dtype).removeprefix("torch."),
-        "device_map": {
-            key: str(value) for key, value in getattr(model, "hf_device_map", {}).items()
-        },
-        "torch_version": torch.__version__,
-        "transformers_version": transformers.__version__,
-    }
+    plan = _build_plan(
+        collector.stats, args, top_k=adapter.top_k, original_width=adapter.original_width
+    )
+    metadata = _base_metadata(
+        args,
+        config_fingerprint=_fingerprint(model.config),
+        tokens=collector.stats["n_tokens"],
+        revision=args.model_revision,
+        batch_size=args.batch_size,
+    )
+    metadata.update(
+        {
+            "source_revision": args.model_revision,
+            "dtype": str(dtype).removeprefix("torch."),
+            "device_map": {
+                key: str(value) for key, value in getattr(model, "hf_device_map", {}).items()
+            },
+        }
+    )
     return save_checkpoint(
         model,
         plan,
@@ -323,53 +345,24 @@ def run_stream_prune(args: argparse.Namespace) -> Path:
     torch.save(stats, Path(workdir) / "stats.pt")
     print(f"source perplexity {result['perplexity']:.4f} on {args.eval_sequences} sequences")
 
-    layer_indices = stats["layer_indices"]
-    if args.strategy == "winnow":
-        plan = select_channels(
-            channel_scores(stats),
-            args.keep,
-            top_k=config.num_experts_per_tok,
-            block_size=args.block_size,
-            layer_indices=layer_indices,
-        )
-    else:
-        plan = select_experts(
-            reap_scores(stats),
-            args.keep,
-            top_k=config.num_experts_per_tok,
-            original_width=config.moe_intermediate_size,
-            layer_indices=layer_indices,
-        )
-
-    metadata = {
-        "winnow_version": __version__,
-        "source_model": args.model,
-        "source_commit": _hub_sha("model", args.model, None),
-        "source_config_sha256": _fingerprint(config),
-        "source_perplexity": result["perplexity"],
-        "calibration": {
-            "dataset": args.calibration,
-            "config": args.dataset_config,
-            "split": args.split,
-            "text_field": args.text_field,
-            "revision": args.dataset_revision,
-            "commit": _hub_sha("dataset", args.calibration, args.dataset_revision),
-            "sequences": args.sequences,
-            "eval_sequences": args.eval_sequences,
-            "sequence_length": args.sequence_length,
-            "tokens": stats["n_tokens"],
-            "seed": args.seed,
-            "packing": "EOS-separated contiguous blocks",
-        },
-        "score": (
-            "mean(actual_router_weight * abs(post_swiglu_activation) * down_column_l2)"
-            if args.strategy == "winnow"
-            else "mean(normalized_topk_router_weight * ungated_expert_output_l2)"
-        ),
-        "pipeline": f"layer-streamed, {ranks} data-parallel ranks",
-        "torch_version": torch.__version__,
-        "transformers_version": transformers.__version__,
-    }
+    plan = _build_plan(
+        stats,
+        args,
+        top_k=config.num_experts_per_tok,
+        original_width=config.moe_intermediate_size,
+    )
+    metadata = _base_metadata(
+        args,
+        config_fingerprint=_fingerprint(config),
+        tokens=stats["n_tokens"],
+        eval_sequences=args.eval_sequences,
+    )
+    metadata.update(
+        {
+            "source_perplexity": result["perplexity"],
+            "pipeline": f"layer-streamed, {ranks} data-parallel ranks",
+        }
+    )
     return save_checkpoint_streamed(
         checkpoint, plan, args.output, metadata=metadata, tokenizer=tokenizer
     )

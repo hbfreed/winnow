@@ -30,42 +30,32 @@ def _backbone(model: nn.Module) -> nn.Module:
     return getattr(base, "language_model", None) or base
 
 
-def _source_config(model: nn.Module, family: str):
-    if family == "qwen3_5_moe":
-        return getattr(model.config, "text_config", None) or model.config
-    return model.config
+def _source_config(model: nn.Module):
+    return getattr(model.config, "text_config", None) or model.config
+
+
+FAMILIES = {
+    "olmoe": (WinnowOlmoeConfig, WinnowOlmoeForCausalLM),
+    "qwen3_5_moe": (WinnowQwen3_5MoeConfig, WinnowQwen3_5MoeForCausalLM),
+    "laguna": (WinnowLagunaConfig, WinnowLagunaForCausalLM),
+}
 
 
 def _runtime_types(family: str):
-    if family == "olmoe":
-        return WinnowOlmoeConfig, WinnowOlmoeForCausalLM
-    if family == "qwen3_5_moe":
-        return WinnowQwen3_5MoeConfig, WinnowQwen3_5MoeForCausalLM
-    if family == "laguna":
-        return WinnowLagunaConfig, WinnowLagunaForCausalLM
-    raise ValueError(f"unsupported model family {family!r}")
+    try:
+        return FAMILIES[family]
+    except KeyError:
+        raise ValueError(f"unsupported model family {family!r}") from None
 
 
 def _runtime_names(family: str) -> tuple[str, str, str, str]:
-    if family == "olmoe":
-        return (
-            "WinnowOlmoeConfig",
-            "WinnowOlmoeForCausalLM",
-            "configuration_winnow_olmoe.py",
-            "modeling_winnow_olmoe.py",
-        )
-    if family == "laguna":
-        return (
-            "WinnowLagunaConfig",
-            "WinnowLagunaForCausalLM",
-            "configuration_winnow_laguna.py",
-            "modeling_winnow_laguna.py",
-        )
+    config_type, model_type = _runtime_types(family)
+    stem = config_type.model_type  # e.g. "winnow_olmoe" — the shim filenames follow it
     return (
-        "WinnowQwen3_5MoeConfig",
-        "WinnowQwen3_5MoeForCausalLM",
-        "configuration_winnow_qwen3_5_moe.py",
-        "modeling_winnow_qwen3_5_moe.py",
+        config_type.__name__,
+        model_type.__name__,
+        f"configuration_{stem}.py",
+        f"modeling_{stem}.py",
     )
 
 
@@ -170,9 +160,7 @@ def save_checkpoint(
     """Write a self-contained Hugging Face checkpoint and ``winnow.json``."""
     adapter = adapter_for(model)
     _config_type, model_type = _runtime_types(adapter.family)
-    config = build_runtime_config(
-        adapter.family, _source_config(model, adapter.family).to_dict(), plan
-    )
+    config = build_runtime_config(adapter.family, _source_config(model).to_dict(), plan)
 
     state = extract_state(model, plan)
     with init_empty_weights(include_buffers=False):
@@ -313,31 +301,31 @@ def save_checkpoint_streamed(
 
         fused = f"{prefix}mlp.experts.gate_up_proj" in reader.index
         if fused:
-            # Read the packed expert tensors once per layer; one layer of
-            # experts is the working-set size the streamed path already assumes.
-            fused_gate_up = reader.get(f"{prefix}mlp.experts.gate_up_proj")
-            fused_down = reader.get(f"{prefix}mlp.experts.down_proj")
+            # Lazy slices: only the surviving experts' slabs are read from disk.
+            gate_up_slice = reader.get_slice(f"{prefix}mlp.experts.gate_up_proj")
+            down_slice = reader.get_slice(f"{prefix}mlp.experts.down_proj")
         for slot, (expert, channels) in enumerate(
             zip(layer_plan.experts, layer_plan.channels, strict=True)
         ):
             channel_tensor = torch.tensor(channels, dtype=torch.long)
-            rows = torch.cat([channel_tensor, channel_tensor + width])
             if fused:
-                gate_up = fused_gate_up[expert]
-                down = fused_down[expert]
+                rows = torch.cat([channel_tensor, channel_tensor + width])
+                gate_up = gate_up_slice[expert].index_select(0, rows)
+                down = down_slice[expert].index_select(1, channel_tensor)
             else:
                 gate = reader.get(f"{prefix}mlp.experts.{expert}.gate_proj.weight")
                 up = reader.get(f"{prefix}mlp.experts.{expert}.up_proj.weight")
-                gate_up = torch.cat([gate, up], dim=0)
-                down = reader.get(f"{prefix}mlp.experts.{expert}.down_proj.weight")
-            writer.add(
-                f"{prefix}mlp.experts.gate_up_projs.{slot}",
-                gate_up.index_select(0, rows),
-            )
-            writer.add(
-                f"{prefix}mlp.experts.down_projs.{slot}",
-                down.index_select(1, channel_tensor),
-            )
+                gate_up = torch.cat(
+                    [
+                        gate.index_select(0, channel_tensor),
+                        up.index_select(0, channel_tensor),
+                    ]
+                )
+                down = reader.get(f"{prefix}mlp.experts.{expert}.down_proj.weight").index_select(
+                    1, channel_tensor
+                )
+            writer.add(f"{prefix}mlp.experts.gate_up_projs.{slot}", gate_up)
+            writer.add(f"{prefix}mlp.experts.down_projs.{slot}", down)
 
         consumed_suffixes = (
             ".mlp.gate.weight",
