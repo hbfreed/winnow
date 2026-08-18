@@ -1,5 +1,11 @@
 # Release plan
 
+Winnow 0.2 adds these parts:
+
+- Score and prune poolside Laguna models (native `transformers>=5.13` support).
+- `stream-prune` and `stream-eval`: layer-streamed, data-parallel scoring,
+  checkpoint writing, and held-out perplexity for models larger than memory.
+
 Winnow 0.1 has these parts:
 
 - Score and prune OLMoE models.

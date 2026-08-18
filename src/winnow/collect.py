@@ -15,7 +15,9 @@ from .adapters import ModelAdapter, adapter_for
 class StatsCollector:
     """Collect both score types in one calibration pass."""
 
-    def __init__(self, model: nn.Module, adapter: ModelAdapter | None = None) -> None:
+    def __init__(self, model: nn.Module | None, adapter: ModelAdapter | None = None) -> None:
+        if model is None and adapter is None:
+            raise ValueError("an adapter is required when no model is given")
         self.model = model
         self.adapter = adapter or adapter_for(model)
         layers = len(self.adapter.layers)
@@ -108,10 +110,16 @@ class StatsCollector:
 
         device = hidden_states.device
         mask_device = None if mask is None else mask.to(device)
-        probabilities = F.softmax(router_logits.to(device), dim=-1, dtype=torch.float32)
-        normalized_weights = probabilities.gather(1, indices.to(device))
-        normalized_weights /= normalized_weights.sum(dim=-1, keepdim=True)
         actual_weights = actual_weights.to(device=device, dtype=torch.float32)
+        if self.adapter.family == "laguna":
+            # Laguna routes with sigmoid scores, so a softmax over its logits is
+            # meaningless; the gate's returned weights are already the normalized
+            # top-k routing weights (renormalize to stay exact under float32).
+            normalized_weights = actual_weights / actual_weights.sum(dim=-1, keepdim=True)
+        else:
+            probabilities = F.softmax(router_logits.to(device), dim=-1, dtype=torch.float32)
+            normalized_weights = probabilities.gather(1, indices.to(device))
+            normalized_weights /= normalized_weights.sum(dim=-1, keepdim=True)
         indices = indices.to(device)
 
         counts = torch.zeros(experts, dtype=torch.int64)
@@ -150,23 +158,35 @@ class StatsCollector:
         if position == len(self.adapter.layers) - 1:
             self._mask = None
 
+    def attach_block(self, position: int, block: nn.Module) -> list[RemovableHandle]:
+        """Attach the calibration hooks for one MoE block at ``position``.
+
+        Returns the handles so a layer-streaming caller can remove them before
+        the block is discarded; they are also tracked for ``detach``.
+        """
+        handles = [
+            block.gate.register_forward_hook(self._gate_hook(position)),
+            block.experts.register_forward_hook(self._experts_hook(position), with_kwargs=True),
+        ]
+        act_fn = block.experts.act_fn
+        if isinstance(act_fn, nn.Module):
+            handles.append(
+                act_fn.register_forward_pre_hook(self._stash_hook(position, block.experts))
+            )
+        self._handles.extend(handles)
+        return handles
+
     def attach(self) -> Self:
         """Attach the calibration hooks."""
         if self._handles:
             raise RuntimeError("the collector is already attached")
+        if self.model is None:
+            raise RuntimeError("hooks need a model; use attach_block for streamed layers")
         self._handles.append(
             self.model.register_forward_pre_hook(self._capture_mask, with_kwargs=True)
         )
         for position, (_layer_index, block) in enumerate(self.adapter.layers):
-            self._handles.append(block.gate.register_forward_hook(self._gate_hook(position)))
-            self._handles.append(
-                block.experts.register_forward_hook(self._experts_hook(position), with_kwargs=True)
-            )
-            act_fn = block.experts.act_fn
-            if isinstance(act_fn, nn.Module):
-                self._handles.append(
-                    act_fn.register_forward_pre_hook(self._stash_hook(position, block.experts))
-                )
+            self.attach_block(position, block)
         return self
 
     def detach(self) -> None:

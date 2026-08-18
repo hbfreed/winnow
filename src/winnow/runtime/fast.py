@@ -77,6 +77,54 @@ class FastRaggedMoE(nn.Module):
             )
         return self._plan_cache
 
+    @property
+    def is_int8(self) -> bool:
+        return self.w_gate.dtype == torch.int8
+
+    def quantize_int8_(self) -> None:
+        """Convert the packed expert weights to symmetric per-channel INT8.
+
+        Gate/up scales follow their packed output columns ``[total_width]``;
+        down scales are per expert and output channel ``[num_experts, hidden]``,
+        matching :func:`winnow.runtime.int8_moe.fused_moe_forward_int8`.  The
+        BF16 parameters are replaced by INT8 buffers, so a quantized module
+        cannot be converted back.
+        """
+        if self.is_int8:
+            return
+
+        def _per_column(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            scale = weight.abs().amax(dim=0).float().clamp_min(1e-8) / 127.0
+            quantized = (
+                torch.round(weight.float() / scale).clamp_(-127, 127).to(torch.int8)
+            )
+            return quantized, scale
+
+        gate, gate_scale = _per_column(self.w_gate.data)
+        up, up_scale = _per_column(self.w_up.data)
+        down = torch.empty_like(self.w_down.data, dtype=torch.int8)
+        down_scale = torch.empty(
+            self.num_experts, self.hidden_size, dtype=torch.float32, device=down.device
+        )
+        offset = 0
+        for expert, width in enumerate(self.expert_widths):
+            rows = self.w_down.data[offset : offset + width]
+            scale = rows.abs().amax(dim=0).float().clamp_min(1e-8) / 127.0
+            down[offset : offset + width] = (
+                torch.round(rows.float() / scale).clamp_(-127, 127).to(torch.int8)
+            )
+            down_scale[expert] = scale
+            offset += width
+
+        for name in ("w_gate", "w_up", "w_down"):
+            del self._parameters[name]
+        self.register_buffer("w_gate", gate)
+        self.register_buffer("w_up", up)
+        self.register_buffer("w_down", down)
+        self.register_buffer("w_gate_scale", gate_scale)
+        self.register_buffer("w_up_scale", up_scale)
+        self.register_buffer("w_down_scale", down_scale)
+
     def _routed(
         self, x: torch.Tensor, weights: torch.Tensor, experts: torch.Tensor
     ) -> torch.Tensor:
@@ -89,6 +137,22 @@ class FastRaggedMoE(nn.Module):
         ):
             raise RuntimeError("the fused Winnow runtime is inference-only")
         with torch.cuda.device(x.device):
+            if self.is_int8:
+                from .int8_moe import fused_moe_forward_int8
+
+                return fused_moe_forward_int8(
+                    x,
+                    weights.flatten(),
+                    experts.flatten().int(),
+                    self._plan(x.device),
+                    self.top_k,
+                    self.w_gate,
+                    self.w_up,
+                    self.w_down,
+                    self.w_gate_scale,
+                    self.w_up_scale,
+                    self.w_down_scale,
+                )
             return fused_moe_forward(
                 x,
                 weights.flatten(),
@@ -138,4 +202,46 @@ class FastQwenMoE(FastRaggedMoE):
         return (self._routed(x, weights, experts) + shared).reshape(shape)
 
 
-__all__ = ["FastOlmoeMoE", "FastQwenMoE", "FastRaggedMoE"]
+class FastLagunaMoE(FastRaggedMoE):
+    """Fused Laguna block: sigmoid routing, bias-corrected selection, scaling.
+
+    The router selects on ``sigmoid(logits) + e_score_correction_bias`` but
+    weights by the unbiased sigmoid scores, normalized over the top-k; the
+    routed output is scaled by ``routed_scaling_factor`` and the shared expert
+    is added unweighted.  Router logit softcapping is not supported (both
+    released Laguna 2.1 checkpoints ship with softcapping disabled).
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        widths: list[int],
+        top_k: int,
+        routed_scaling_factor: float = 1.0,
+    ) -> None:
+        super().__init__(hidden_size, widths, top_k)
+        self.routed_scaling_factor = float(routed_scaling_factor)
+        self.e_score_correction_bias = nn.Parameter(
+            torch.zeros(len(widths)), requires_grad=False
+        )
+        self.shared_experts: nn.Module | None = None
+
+    @torch.compiler.disable
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.shared_experts is None:
+            raise RuntimeError("the Laguna shared expert is not attached")
+        shape = hidden_states.shape
+        x = hidden_states.reshape(-1, shape[-1])
+        scores = torch.sigmoid(self.gate(x).float())
+        _, experts = torch.topk(
+            scores + self.e_score_correction_bias.float(), self.top_k, dim=-1
+        )
+        weights = scores.gather(-1, experts)
+        weights = weights / weights.sum(dim=-1, keepdim=True)
+        routed = self._routed(x, weights.to(x.dtype), experts)
+        if self.routed_scaling_factor != 1.0:
+            routed = routed * self.routed_scaling_factor
+        return (routed + self.shared_experts(x)).reshape(shape)
+
+
+__all__ = ["FastLagunaMoE", "FastOlmoeMoE", "FastQwenMoE", "FastRaggedMoE"]

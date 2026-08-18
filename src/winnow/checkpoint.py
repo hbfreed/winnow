@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from importlib.resources import files
 from pathlib import Path
@@ -15,6 +16,8 @@ from torch import nn
 from .adapters import adapter_for
 from .plan import PruningPlan
 from .runtime import (
+    WinnowLagunaConfig,
+    WinnowLagunaForCausalLM,
     WinnowOlmoeConfig,
     WinnowOlmoeForCausalLM,
     WinnowQwen3_5MoeConfig,
@@ -38,6 +41,8 @@ def _runtime_types(family: str):
         return WinnowOlmoeConfig, WinnowOlmoeForCausalLM
     if family == "qwen3_5_moe":
         return WinnowQwen3_5MoeConfig, WinnowQwen3_5MoeForCausalLM
+    if family == "laguna":
+        return WinnowLagunaConfig, WinnowLagunaForCausalLM
     raise ValueError(f"unsupported model family {family!r}")
 
 
@@ -48,6 +53,13 @@ def _runtime_names(family: str) -> tuple[str, str, str, str]:
             "WinnowOlmoeForCausalLM",
             "configuration_winnow_olmoe.py",
             "modeling_winnow_olmoe.py",
+        )
+    if family == "laguna":
+        return (
+            "WinnowLagunaConfig",
+            "WinnowLagunaForCausalLM",
+            "configuration_winnow_laguna.py",
+            "modeling_winnow_laguna.py",
         )
     return (
         "WinnowQwen3_5MoeConfig",
@@ -80,6 +92,11 @@ def extract_state(model: nn.Module, plan: PruningPlan) -> dict[str, torch.Tensor
             state[f"model.layers.{layer_plan.layer}.mlp.gate.weight"] = (
                 block.gate.weight.index_select(0, survivor_tensor).contiguous()
             )
+            bias = getattr(block.gate, "e_score_correction_bias", None)
+            if bias is not None:
+                state[f"model.layers.{layer_plan.layer}.mlp.gate.e_score_correction_bias"] = (
+                    bias.index_select(0, survivor_tensor.to(bias.device)).contiguous()
+                )
             for slot, (expert, channels) in enumerate(
                 zip(layer_plan.experts, layer_plan.channels, strict=True)
             ):
@@ -97,20 +114,11 @@ def extract_state(model: nn.Module, plan: PruningPlan) -> dict[str, torch.Tensor
     return state
 
 
-def save_checkpoint(
-    model: nn.Module,
-    plan: PruningPlan,
-    output: str | Path,
-    *,
-    metadata: dict[str, Any],
-    tokenizer=None,
-    max_shard_size: str = "5GB",
-) -> Path:
-    """Write a self-contained Hugging Face checkpoint and ``winnow.json``."""
-    adapter = adapter_for(model)
-    config_type, model_type = _runtime_types(adapter.family)
-    config_name, architecture, config_file, model_file = _runtime_names(adapter.family)
-    base = _source_config(model, adapter.family).to_dict()
+def build_runtime_config(family: str, source_config_dict: dict, plan: PruningPlan):
+    """Build the pruned-runtime configuration for one plan."""
+    config_type, _model_type = _runtime_types(family)
+    config_name, architecture, config_file, model_file = _runtime_names(family)
+    base = dict(source_config_dict)
     for key in ("model_type", "architectures", "auto_map", "transformers_version"):
         base.pop(key, None)
     config = config_type(
@@ -128,6 +136,43 @@ def save_checkpoint(
         "strategy": plan.strategy,
         "keep": plan.keep,
     }
+    return config
+
+
+def _write_support_files(
+    output: Path, family: str, plan: PruningPlan, metadata: dict[str, Any], tokenizer
+) -> None:
+    """Write the shim modules, ``winnow.json``, and tokenizer files."""
+    _config_name, _architecture, config_file, model_file = _runtime_names(family)
+    if tokenizer is not None:
+        tokenizer.save_pretrained(output)
+    code = files("winnow.checkpoint_code")
+    for filename in (config_file, model_file):
+        shutil.copyfile(code.joinpath(filename), output / filename)
+    complete_metadata = dict(metadata)
+    complete_metadata["schema_version"] = 1
+    complete_metadata["plan"] = plan.to_dict()
+    (output / "winnow.json").write_text(
+        json.dumps(complete_metadata, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def save_checkpoint(
+    model: nn.Module,
+    plan: PruningPlan,
+    output: str | Path,
+    *,
+    metadata: dict[str, Any],
+    tokenizer=None,
+    max_shard_size: str = "5GB",
+) -> Path:
+    """Write a self-contained Hugging Face checkpoint and ``winnow.json``."""
+    adapter = adapter_for(model)
+    _config_type, model_type = _runtime_types(adapter.family)
+    config = build_runtime_config(
+        adapter.family, _source_config(model, adapter.family).to_dict(), plan
+    )
 
     state = extract_state(model, plan)
     with init_empty_weights(include_buffers=False):
@@ -143,17 +188,172 @@ def save_checkpoint(
         safe_serialization=True,
         max_shard_size=max_shard_size,
     )
-    if tokenizer is not None:
-        tokenizer.save_pretrained(output)
+    _write_support_files(output, adapter.family, plan, metadata, tokenizer)
+    return output
 
-    code = files("winnow.checkpoint_code")
-    for filename in (config_file, model_file):
-        shutil.copyfile(code.joinpath(filename), output / filename)
-    complete_metadata = dict(metadata)
-    complete_metadata["schema_version"] = 1
-    complete_metadata["plan"] = plan.to_dict()
-    (output / "winnow.json").write_text(
-        json.dumps(complete_metadata, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+
+class _ShardWriter:
+    """Accumulate tensors and flush them as size-capped safetensors shards."""
+
+    def __init__(self, output: Path, max_shard_bytes: int) -> None:
+        self.output = output
+        self.max_shard_bytes = max_shard_bytes
+        self.pending: dict[str, torch.Tensor] = {}
+        self.pending_bytes = 0
+        self.total_bytes = 0
+        self.files: list[Path] = []
+        self.weight_map: dict[str, int] = {}
+
+    def add(self, name: str, tensor: torch.Tensor) -> None:
+        tensor = tensor.contiguous()
+        self.pending[name] = tensor
+        self.weight_map[name] = len(self.files)
+        self.pending_bytes += tensor.numel() * tensor.dtype.itemsize
+        self.total_bytes += tensor.numel() * tensor.dtype.itemsize
+        if self.pending_bytes >= self.max_shard_bytes:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self.pending:
+            return
+        from safetensors.torch import save_file
+
+        path = self.output / f"shard-{len(self.files):05d}.tmp"
+        save_file(self.pending, path)
+        self.files.append(path)
+        self.pending = {}
+        self.pending_bytes = 0
+
+    def finalize(self) -> None:
+        self.flush()
+        count = len(self.files)
+        if count == 1:
+            names = {0: "model.safetensors"}
+            self.files[0].rename(self.output / names[0])
+        else:
+            names = {i: f"model-{i + 1:05d}-of-{count:05d}.safetensors" for i in range(count)}
+            for i, path in enumerate(self.files):
+                path.rename(self.output / names[i])
+            index = {
+                "metadata": {"total_size": self.total_bytes},
+                "weight_map": {
+                    name: names[shard] for name, shard in self.weight_map.items()
+                },
+            }
+            (self.output / "model.safetensors.index.json").write_text(
+                json.dumps(index, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+
+
+def save_checkpoint_streamed(
+    source: str | Path,
+    plan: PruningPlan,
+    output: str | Path,
+    *,
+    metadata: dict[str, Any],
+    tokenizer=None,
+    max_shard_bytes: int = 4 * 2**30,
+) -> Path:
+    """Write a pruned checkpoint straight from source shards, tensor by tensor.
+
+    Unlike :func:`save_checkpoint` this never materializes the model, so it
+    works for checkpoints far larger than memory.  Laguna only for now.
+    """
+    from .stream import ShardReader, _load_config
+
+    source = Path(source)
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=True)
+    source_config = _load_config(source)
+    if source_config.model_type != "laguna":
+        raise ValueError("the streamed writer currently supports the laguna family only")
+    family = "laguna"
+    config = build_runtime_config(family, source_config.to_dict(), plan)
+
+    reader = ShardReader(source)
+    plan_by_layer = {layer_plan.layer: layer_plan for layer_plan in plan.layers}
+    width = plan.original_width
+    by_layer: dict[int, list[str]] = {}
+    other: list[str] = []
+    for name in reader.names:
+        match = re.search(r"^model\.layers\.(\d+)\.", name)
+        if match:
+            by_layer.setdefault(int(match.group(1)), []).append(name)
+        else:
+            other.append(name)
+
+    writer = _ShardWriter(output, max_shard_bytes)
+    if "model.embed_tokens.weight" in other:
+        writer.add("model.embed_tokens.weight", reader.get("model.embed_tokens.weight"))
+
+    def _rename(name: str) -> str:
+        return name.replace(".mlp.shared_expert.", ".mlp.shared_experts.")
+
+    for layer_idx in sorted(by_layer):
+        names = by_layer[layer_idx]
+        layer_plan = plan_by_layer.get(layer_idx)
+        prefix = f"model.layers.{layer_idx}."
+        if layer_plan is None:
+            for name in names:
+                writer.add(_rename(name), reader.get(name))
+            continue
+
+        survivors = torch.tensor(layer_plan.experts, dtype=torch.long)
+        gate_weight = reader.get(f"{prefix}mlp.gate.weight")
+        writer.add(f"{prefix}mlp.gate.weight", gate_weight.index_select(0, survivors))
+        bias_names = (
+            f"{prefix}mlp.gate.e_score_correction_bias",
+            f"{prefix}mlp.experts.e_score_correction_bias",
+        )
+        bias = next(
+            (reader.get(name) for name in bias_names if name in reader.index),
+            torch.zeros(plan.original_experts, dtype=gate_weight.dtype),
+        )
+        writer.add(bias_names[0], bias.index_select(0, survivors))
+
+        fused = f"{prefix}mlp.experts.gate_up_proj" in reader.index
+        if fused:
+            # Read the packed expert tensors once per layer; one layer of
+            # experts is the working-set size the streamed path already assumes.
+            fused_gate_up = reader.get(f"{prefix}mlp.experts.gate_up_proj")
+            fused_down = reader.get(f"{prefix}mlp.experts.down_proj")
+        for slot, (expert, channels) in enumerate(
+            zip(layer_plan.experts, layer_plan.channels, strict=True)
+        ):
+            channel_tensor = torch.tensor(channels, dtype=torch.long)
+            rows = torch.cat([channel_tensor, channel_tensor + width])
+            if fused:
+                gate_up = fused_gate_up[expert]
+                down = fused_down[expert]
+            else:
+                gate = reader.get(f"{prefix}mlp.experts.{expert}.gate_proj.weight")
+                up = reader.get(f"{prefix}mlp.experts.{expert}.up_proj.weight")
+                gate_up = torch.cat([gate, up], dim=0)
+                down = reader.get(f"{prefix}mlp.experts.{expert}.down_proj.weight")
+            writer.add(
+                f"{prefix}mlp.experts.gate_up_projs.{slot}",
+                gate_up.index_select(0, rows),
+            )
+            writer.add(
+                f"{prefix}mlp.experts.down_projs.{slot}",
+                down.index_select(1, channel_tensor),
+            )
+
+        consumed_suffixes = (
+            ".mlp.gate.weight",
+            ".e_score_correction_bias",
+        )
+        for name in names:
+            if ".mlp.experts." in name or name.endswith(consumed_suffixes):
+                continue
+            writer.add(_rename(name), reader.get(name))
+
+    for name in other:
+        if name != "model.embed_tokens.weight":
+            writer.add(name, reader.get(name))
+
+    writer.finalize()
+    reader.close()
+    config.save_pretrained(output)
+    _write_support_files(output, family, plan, metadata, tokenizer)
     return output

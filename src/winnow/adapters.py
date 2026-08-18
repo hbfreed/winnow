@@ -55,9 +55,12 @@ def adapter_for(model: nn.Module) -> ModelAdapter:
         family = "olmoe"
     elif model_type in {"qwen3_5_moe", "qwen3_5_moe_text"}:
         family = "qwen3_5_moe"
+    elif model_type == "laguna":
+        family = "laguna"
     else:
         raise ValueError(
-            f"unsupported model type {model_type!r}; supported types are olmoe and qwen3_5_moe"
+            f"unsupported model type {model_type!r}; "
+            "supported types are olmoe, qwen3_5_moe, and laguna"
         )
 
     layers = fused_moe_layers(model)
