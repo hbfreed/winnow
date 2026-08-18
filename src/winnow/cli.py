@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import sys
+import tempfile
 from pathlib import Path
 
 import torch
@@ -246,9 +247,9 @@ def run_prune(args: argparse.Namespace) -> Path:
 
 def _load_tokenizer(checkpoint, revision: str | None = None):
     """Load a tokenizer, applying the Mistral regex fix for Laguna models."""
-    from .stream import _load_config
+    from .stream import load_config
 
-    config = _load_config(checkpoint)
+    config = load_config(checkpoint)
     kwargs = {}
     if str(getattr(config, "model_type", "")).startswith("winnow_"):
         # Our own checkpoints carry an auto_map to the winnow shim modules;
@@ -301,10 +302,10 @@ def _stream_ranks(requested: int) -> int:
 def run_stream_prune(args: argparse.Namespace) -> Path:
     """Score, prune, and write a checkpoint without ever loading the model."""
     from .checkpoint import save_checkpoint_streamed
-    from .stream import _load_config, stream_run
+    from .stream import load_config, stream_run
 
     checkpoint = _resolve_checkpoint(args.model)
-    config = _load_config(checkpoint)
+    config = load_config(checkpoint)
     tokenizer = _load_tokenizer(checkpoint)
     sequences = _collect_sequences(tokenizer, args, args.sequences + args.eval_sequences)
     ranks = _stream_ranks(args.ranks)
@@ -381,7 +382,8 @@ def run_stream_eval(args: argparse.Namespace) -> float:
     checkpoint = _resolve_checkpoint(args.model)
     tokenizer = _load_tokenizer(checkpoint)
     sequences = _collect_sequences(tokenizer, args, args.sequences, skip=args.skip_sequences)
-    workdir = args.workdir or checkpoint / "streameval-work"
+    # Not under `checkpoint`: for a hub slug that is the read-only cache snapshot.
+    workdir = args.workdir or Path(tempfile.mkdtemp(prefix="winnow-streameval-"))
     result = stream_run(
         checkpoint,
         sequences,

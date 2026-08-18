@@ -57,12 +57,12 @@ def load_fast_laguna(
     """Build a pruned Laguna model on the fused runtime, ready to generate."""
     from accelerate import dispatch_model, init_empty_weights
 
-    from ..stream import ShardReader, _load_config, _sparse_positions
+    from ..stream import ShardReader, load_config, _sparse_positions
     from .fast import FastLagunaMoE
     from .laguna import WinnowLagunaForCausalLM
 
     checkpoint = Path(checkpoint)
-    config = _load_config(checkpoint)
+    config = load_config(checkpoint)
     if config.model_type not in ("winnow_laguna", "laguna"):
         raise ValueError(f"expected a (pruned) Laguna checkpoint, got {config.model_type!r}")
     if getattr(config, "expert_widths", None) is None:

@@ -259,12 +259,12 @@ def save_checkpoint_streamed(
     Unlike :func:`save_checkpoint` this never materializes the model, so it
     works for checkpoints far larger than memory.  Laguna only for now.
     """
-    from .stream import ShardReader, _load_config
+    from .stream import ShardReader, load_config
 
     source = Path(source)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
-    source_config = _load_config(source)
+    source_config = load_config(source)
     if source_config.model_type != "laguna":
         raise ValueError("the streamed writer currently supports the laguna family only")
     family = "laguna"

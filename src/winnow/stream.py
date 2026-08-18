@@ -1,5 +1,9 @@
 """Layer-streaming calibration and evaluation for models larger than memory.
 
+The streamed path currently supports the Laguna family only: layers are
+rebuilt with ``LagunaDecoderLayer``, so other families must go through the
+in-memory ``prune`` path.
+
 The streamed pass never holds more than one decoder layer of weights per
 device.  The residual stream for every calibration sequence is kept in two
 disk-backed ping-pong buffers per rank: each sweep step reads the layer input
@@ -32,7 +36,7 @@ from .collect import StatsCollector
 _ADDITIVE_KEYS = ("token_count", "reap_sum", "channel_sum")
 
 
-def _load_config(checkpoint: str | Path):
+def load_config(checkpoint: str | Path):
     """Load a checkpoint config without going through remote-code resolution.
 
     Winnow's own pruned checkpoints carry an ``auto_map`` for end users, but
@@ -288,7 +292,7 @@ def run_rank_sweep(
     Returns ``{"stats": ..., "loss_sum": float, "loss_tokens": int}`` where
     ``stats`` is ``None`` when ``collect_stats`` is off.
     """
-    config = _load_config(checkpoint)
+    config = load_config(checkpoint)
     reader = ShardReader(checkpoint)
     positions = _sparse_positions(config)
 
@@ -396,7 +400,7 @@ def _write_rank_shards(
     dtype: torch.dtype,
 ) -> list[RankData]:
     """Embed all sequences on CPU and split them into per-rank buffers."""
-    config = _load_config(checkpoint)
+    config = load_config(checkpoint)
     reader = ShardReader(checkpoint)
     embeddings = reader.get("model.embed_tokens.weight").to(torch.float32)
     reader.close()
@@ -511,6 +515,12 @@ def stream_run(
         results = [
             torch.load(data.directory / "result.pt", weights_only=False) for data in rank_data
         ]
+
+    # The residual and token buffers are pure scratch and can be tens of
+    # gigabytes; drop them as soon as the per-rank results are in.
+    for data in rank_data:
+        for scratch in ("residual_a.bin", "residual_b.bin", "token_ids.bin"):
+            (data.directory / scratch).unlink(missing_ok=True)
 
     loss_sum = sum(result["loss_sum"] for result in results)
     loss_tokens = sum(result["loss_tokens"] for result in results)
