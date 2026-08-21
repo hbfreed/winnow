@@ -224,9 +224,7 @@ class _ShardWriter:
                 path.rename(self.output / names[i])
             index = {
                 "metadata": {"total_size": self.total_bytes},
-                "weight_map": {
-                    name: names[shard] for name, shard in self.weight_map.items()
-                },
+                "weight_map": {name: names[shard] for name, shard in self.weight_map.items()},
             }
             (self.output / "model.safetensors.index.json").write_text(
                 json.dumps(index, indent=2, sort_keys=True) + "\n", encoding="utf-8"

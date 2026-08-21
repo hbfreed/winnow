@@ -477,7 +477,9 @@ def _spawn_worker(rank: int, rank_data: list[RankData], checkpoint: str, kwargs:
 
 def merge_stats(parts: list[dict]) -> dict:
     """Sum per-rank statistics into one stats dict."""
-    merged = {key: value.clone() if torch.is_tensor(value) else value for key, value in parts[0].items()}
+    merged = {
+        key: value.clone() if torch.is_tensor(value) else value for key, value in parts[0].items()
+    }
     for part in parts[1:]:
         merged["n_tokens"] += part["n_tokens"]
         for key in _ADDITIVE_KEYS:

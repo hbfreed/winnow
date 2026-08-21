@@ -107,9 +107,7 @@ class FastRaggedMoE(nn.Module):
 
         def _per_column(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             scale = weight.abs().amax(dim=0).float().clamp_min(1e-8) / 127.0
-            quantized = (
-                torch.round(weight.float() / scale).clamp_(-127, 127).to(torch.int8)
-            )
+            quantized = torch.round(weight.float() / scale).clamp_(-127, 127).to(torch.int8)
             return quantized, scale
 
         gate, gate_scale = _per_column(self.w_gate.data)
@@ -235,9 +233,7 @@ class FastLagunaMoE(FastRaggedMoE):
     ) -> None:
         super().__init__(hidden_size, widths, top_k, dtype=dtype)
         self.routed_scaling_factor = float(routed_scaling_factor)
-        self.e_score_correction_bias = nn.Parameter(
-            torch.zeros(len(widths)), requires_grad=False
-        )
+        self.e_score_correction_bias = nn.Parameter(torch.zeros(len(widths)), requires_grad=False)
         self.shared_experts: nn.Module | None = None
 
     @torch.compiler.disable
@@ -247,9 +243,7 @@ class FastLagunaMoE(FastRaggedMoE):
         shape = hidden_states.shape
         x = hidden_states.reshape(-1, shape[-1])
         scores = torch.sigmoid(self.gate(x).float())
-        _, experts = torch.topk(
-            scores + self.e_score_correction_bias.float(), self.top_k, dim=-1
-        )
+        _, experts = torch.topk(scores + self.e_score_correction_bias.float(), self.top_k, dim=-1)
         weights = scores.gather(-1, experts)
         weights = weights / weights.sum(dim=-1, keepdim=True)
         routed = self._routed(x, weights.to(x.dtype), experts)

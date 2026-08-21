@@ -163,19 +163,14 @@ def _validate_weights_and_scales(
             f"{tuple(w_gate.shape)} and {tuple(w_up.shape)}"
         )
     if tuple(w_down.shape) != expected_down:
-        raise ValueError(
-            f"down weight must have shape {expected_down}, got {tuple(w_down.shape)}"
-        )
+        raise ValueError(f"down weight must have shape {expected_down}, got {tuple(w_down.shape)}")
     if tuple(w_gate_scale.shape) != (plan.total_width,):
         raise ValueError("gate scale must have one value per packed output channel")
     if tuple(w_up_scale.shape) != (plan.total_width,):
         raise ValueError("up scale must have one value per packed output channel")
     if tuple(w_down_scale.shape) != (plan.num_experts, hidden):
         raise ValueError("down scale must have shape [num_experts, hidden_size]")
-    if any(
-        scale.dtype != torch.float32
-        for scale in (w_gate_scale, w_up_scale, w_down_scale)
-    ):
+    if any(scale.dtype != torch.float32 for scale in (w_gate_scale, w_up_scale, w_down_scale)):
         raise TypeError("INT8 W8A16 scales must have dtype torch.float32")
     tensors = (
         w_gate,
@@ -210,13 +205,9 @@ def fused_moe_forward_int8(
     if hidden != plan.hidden_size:
         raise ValueError(f"expected hidden {plan.hidden_size}, got {hidden}")
     if expert_ids.numel() != num_routes:
-        raise ValueError(
-            f"expected {num_routes} expert ids, got {expert_ids.numel()}"
-        )
+        raise ValueError(f"expected {num_routes} expert ids, got {expert_ids.numel()}")
     if hidden % plan.block_n:
-        raise ValueError(
-            f"hidden size {hidden} must be divisible by block {plan.block_n}"
-        )
+        raise ValueError(f"hidden size {hidden} must be divisible by block {plan.block_n}")
     _validate_weights_and_scales(
         plan,
         hidden,

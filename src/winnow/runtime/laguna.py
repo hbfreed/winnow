@@ -32,9 +32,7 @@ class WinnowLagunaForCausalLM(LagunaForCausalLM):
         widths_table = config.expert_widths
         if widths_table is None:
             return
-        moe_blocks = [
-            layer.mlp for layer in self.model.layers if hasattr(layer.mlp, "experts")
-        ]
+        moe_blocks = [layer.mlp for layer in self.model.layers if hasattr(layer.mlp, "experts")]
         if len(widths_table) != len(moe_blocks):
             raise ValueError("expert_widths must contain one row for each sparse decoder layer")
         for block, widths in zip(moe_blocks, widths_table, strict=True):

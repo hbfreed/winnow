@@ -25,7 +25,9 @@ def _layer_bytes(module: nn.Module) -> int:
 
 def _balanced_device_map(model: nn.Module, devices: list[str]) -> dict[str, str]:
     """Assign whole decoder layers to devices, balancing by byte size."""
-    sizes = [(f"model.layers.{i}", _layer_bytes(layer)) for i, layer in enumerate(model.model.layers)]
+    sizes = [
+        (f"model.layers.{i}", _layer_bytes(layer)) for i, layer in enumerate(model.model.layers)
+    ]
     total = sum(size for _name, size in sizes)
     head_tail = _layer_bytes(model.model.embed_tokens) + _layer_bytes(model.lm_head)
     per_device = (total + head_tail) / len(devices)

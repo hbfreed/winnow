@@ -71,9 +71,7 @@ def test_fast_laguna_matches_reference_math():
         actual = module(inputs)
 
         scores = torch.sigmoid(module.gate(inputs).float())
-        _, experts = torch.topk(
-            scores + module.e_score_correction_bias.float(), 2, dim=-1
-        )
+        _, experts = torch.topk(scores + module.e_score_correction_bias.float(), 2, dim=-1)
         weights = scores.gather(-1, experts)
         weights = weights / weights.sum(dim=-1, keepdim=True)
         expected = torch.zeros_like(inputs, dtype=torch.float32)
