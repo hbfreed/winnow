@@ -20,10 +20,15 @@ class FastRaggedMoE(nn.Module):
         top_k: int,
         *,
         dtype: torch.dtype | None = None,
+        block_size: int | None = None,
     ) -> None:
         super().__init__()
+        if block_size is not None:
+            if block_size < 16 or block_size & (block_size - 1):
+                raise ValueError(f"block_size must be a power of two >= 16, got {block_size}")
+            self.block_size = block_size
         if any(width <= 0 or width % self.block_size for width in widths):
-            raise ValueError("expert widths must be positive multiples of 128")
+            raise ValueError(f"expert widths must be positive multiples of {self.block_size}")
         if top_k > len(widths):
             raise ValueError("top_k cannot be greater than the surviving expert count")
         self.hidden_size = int(hidden_size)
