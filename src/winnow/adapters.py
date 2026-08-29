@@ -22,6 +22,15 @@ class ModelAdapter:
     sigmoid_router: bool = False
 
 
+# Per-family router tensor names, relative to one decoder layer's ``mlp``:
+# the routing weight and the aux-loss-free selection bias candidates in
+# checkpoint order of preference (the first name is the canonical one written).
+ROUTER_TENSORS = {
+    "laguna": ("gate.weight", ("gate.e_score_correction_bias", "experts.e_score_correction_bias")),
+    "afmoe": ("router.gate.weight", ("expert_bias",)),
+}
+
+
 def block_router(block: nn.Module) -> nn.Module:
     """Return one MoE block's routing module (``gate``, or Afmoe's ``router``)."""
     router = getattr(block, "gate", None)

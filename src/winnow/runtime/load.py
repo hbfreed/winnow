@@ -1,11 +1,12 @@
-"""Load a pruned Laguna checkpoint into the fused runtime for serving.
+"""Load a pruned sigmoid-routed checkpoint into the fused runtime for serving.
 
 The pruned keep-50 Laguna-S checkpoint is ~118GB in BF16 — larger than system
 RAM — so the loader materializes it layer by layer: each layer's ragged expert
-tensors are packed into a :class:`~winnow.runtime.fast.FastLagunaMoE` block and
-(optionally) quantized to INT8 W8A16 on the spot, which shrinks the experts 2×
-before the next layer is read.  The finished model is then pipeline-split
-across the visible GPUs with accelerate's ``dispatch_model``.
+tensors are packed into a :class:`~winnow.runtime.fast.FastSigmoidMoE` block
+and (optionally) quantized to INT8 W8A16 on the spot, which shrinks the
+experts 2× before the next layer is read.  The finished model is then
+pipeline-split across the visible GPUs with accelerate's ``dispatch_model``.
+The model family (Laguna or Afmoe) is read from the checkpoint config.
 """
 
 from __future__ import annotations
@@ -49,65 +50,44 @@ def _balanced_device_map(model: nn.Module, devices: list[str]) -> dict[str, str]
     return device_map
 
 
-def _fast_family(config, dtype: torch.dtype):
-    """Return (model_type, block_builder, gate_name, bias_name, bias_attr) for one family."""
-    family = str(config.model_type).removeprefix("winnow_")
+# The config key holding each family's routed-output scaling factor.
+_SCALE_KEYS = {"laguna": "moe_routed_scaling_factor", "afmoe": "route_scale"}
+
+
+def _fast_model_type(family: str):
     if family == "laguna":
-        from .fast import FastLagunaMoE
         from .laguna import WinnowLagunaForCausalLM
 
-        def build(widths: list[int]):
-            return FastLagunaMoE(
-                config.hidden_size,
-                widths,
-                config.num_experts_per_tok,
-                float(getattr(config, "moe_routed_scaling_factor", 1.0)),
-                dtype=dtype,
-            )
+        return WinnowLagunaForCausalLM
+    from .afmoe import WinnowAfmoeForCausalLM
 
-        return (
-            WinnowLagunaForCausalLM,
-            build,
-            "gate.weight",
-            "gate.e_score_correction_bias",
-            "e_score_correction_bias",
-        )
-    if family == "afmoe":
-        from .afmoe import WinnowAfmoeForCausalLM
-        from .fast import FastAfmoeMoE
-
-        def build(widths: list[int]):
-            return FastAfmoeMoE(
-                config.hidden_size,
-                widths,
-                config.num_experts_per_tok,
-                float(getattr(config, "route_scale", 1.0)),
-                dtype=dtype,
-            )
-
-        return (WinnowAfmoeForCausalLM, build, "router.gate.weight", "expert_bias", "expert_bias")
-    raise ValueError(f"the fused loader supports laguna and afmoe, not {config.model_type!r}")
+    return WinnowAfmoeForCausalLM
 
 
-def _load_fast(
+def load_fast(
     checkpoint: str | Path,
     *,
-    family: str,
     int8: bool = True,
     devices: list[str] | None = None,
     dtype: torch.dtype = torch.bfloat16,
 ) -> nn.Module:
+    """Build a pruned Laguna or Afmoe model on the fused runtime, ready to generate."""
     from accelerate import dispatch_model, init_empty_weights
 
+    from ..adapters import ROUTER_TENSORS
     from ..stream import ShardReader, _sparse_positions, load_config
+    from .fast import FastSigmoidMoE
 
     checkpoint = Path(checkpoint)
     config = load_config(checkpoint)
-    if config.model_type not in (f"winnow_{family}", family):
-        raise ValueError(f"expected a (pruned) {family} checkpoint, got {config.model_type!r}")
-    model_type, build_block, gate_name, bias_name, bias_attr = _fast_family(config, dtype)
+    family = str(config.model_type).removeprefix("winnow_")
+    if family not in _SCALE_KEYS:
+        raise ValueError(f"the fused loader supports laguna and afmoe, not {config.model_type!r}")
     if getattr(config, "expert_widths", None) is None:
         raise ValueError("the fused loader expects a Winnow-pruned checkpoint")
+    model_type = _fast_model_type(family)
+    gate_name, bias_names = ROUTER_TENSORS[family]
+    bias_name = bias_names[0]
     with init_empty_weights(include_buffers=False):
         model = model_type(config)
 
@@ -121,13 +101,19 @@ def _load_fast(
         prefix = f"model.layers.{layer_idx}.mlp.experts."
         consumed_prefixes.append(prefix)
         widths = list(config.expert_widths[positions[layer_idx]])
-        fast = build_block(widths)
+        fast = FastSigmoidMoE(
+            config.hidden_size,
+            widths,
+            config.num_experts_per_tok,
+            float(getattr(config, _SCALE_KEYS[family], 1.0)),
+            dtype=dtype,
+        )
         with torch.no_grad():
             fast.gate.weight = nn.Parameter(
                 reader.get(f"model.layers.{layer_idx}.mlp.{gate_name}").to(dtype),
                 requires_grad=False,
             )
-            getattr(fast, bias_attr).data = reader.get(
+            fast.e_score_correction_bias.data = reader.get(
                 f"model.layers.{layer_idx}.mlp.{bias_name}"
             ).float()
             for slot, width in enumerate(widths):
@@ -175,26 +161,4 @@ def _load_fast(
     return dispatch_model(model, device_map=device_map)
 
 
-def load_fast_laguna(
-    checkpoint: str | Path,
-    *,
-    int8: bool = True,
-    devices: list[str] | None = None,
-    dtype: torch.dtype = torch.bfloat16,
-) -> nn.Module:
-    """Build a pruned Laguna model on the fused runtime, ready to generate."""
-    return _load_fast(checkpoint, family="laguna", int8=int8, devices=devices, dtype=dtype)
-
-
-def load_fast_afmoe(
-    checkpoint: str | Path,
-    *,
-    int8: bool = True,
-    devices: list[str] | None = None,
-    dtype: torch.dtype = torch.bfloat16,
-) -> nn.Module:
-    """Build a pruned Afmoe (Arcee Trinity) model on the fused runtime."""
-    return _load_fast(checkpoint, family="afmoe", int8=int8, devices=devices, dtype=dtype)
-
-
-__all__ = ["load_fast_afmoe", "load_fast_laguna"]
+__all__ = ["load_fast"]

@@ -132,21 +132,15 @@ def _family(config) -> str:
     return family
 
 
-def _family_modeling(config):
-    """Return the transformers modeling module for the config's family."""
-    if _family(config) == "afmoe":
-        from transformers.models.afmoe import modeling_afmoe
-
-        return modeling_afmoe
-    from transformers.models.laguna import modeling_laguna
-
-    return modeling_laguna
-
-
 def _family_class(config, suffix: str):
-    modeling = _family_modeling(config)
-    prefix = "Afmoe" if _family(config) == "afmoe" else "Laguna"
-    return getattr(modeling, f"{prefix}{suffix}")
+    """Return the transformers modeling class ``<Family><suffix>`` for the config."""
+    if _family(config) == "afmoe":
+        from transformers.models.afmoe import modeling_afmoe as modeling
+
+        return getattr(modeling, f"Afmoe{suffix}")
+    from transformers.models.laguna import modeling_laguna as modeling
+
+    return getattr(modeling, f"Laguna{suffix}")
 
 
 def _sparse_positions(config) -> dict[int, int]:

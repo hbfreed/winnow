@@ -13,7 +13,7 @@ import torch
 from accelerate import init_empty_weights
 from torch import nn
 
-from .adapters import adapter_for, block_router
+from .adapters import ROUTER_TENSORS, adapter_for, block_router
 from .plan import PruningPlan
 from .runtime import (
     WinnowAfmoeConfig,
@@ -41,14 +41,6 @@ FAMILIES = {
     "qwen3_5_moe": (WinnowQwen3_5MoeConfig, WinnowQwen3_5MoeForCausalLM),
     "laguna": (WinnowLagunaConfig, WinnowLagunaForCausalLM),
     "afmoe": (WinnowAfmoeConfig, WinnowAfmoeForCausalLM),
-}
-
-# Per-family router tensor names, relative to one decoder layer's ``mlp``:
-# the routing weight and the aux-loss-free selection bias candidates in
-# checkpoint order of preference (the first name is the one written).
-_ROUTER_NAMES = {
-    "laguna": ("gate.weight", ("gate.e_score_correction_bias", "experts.e_score_correction_bias")),
-    "afmoe": ("router.gate.weight", ("expert_bias",)),
 }
 
 
@@ -89,7 +81,7 @@ def extract_state(model: nn.Module, plan: PruningPlan) -> dict[str, torch.Tensor
             source = block.experts
             router = block_router(block)
             weight = router.weight if hasattr(router, "weight") else router.gate.weight
-            weight_name, bias_names = _ROUTER_NAMES.get(adapter.family, ("gate.weight", ()))
+            weight_name, bias_names = ROUTER_TENSORS.get(adapter.family, ("gate.weight", ()))
             survivor_tensor = torch.tensor(
                 layer_plan.experts, dtype=torch.long, device=weight.device
             )
@@ -269,9 +261,9 @@ def save_checkpoint_streamed(
     output.mkdir(parents=True, exist_ok=True)
     source_config = load_config(source)
     family = str(source_config.model_type)
-    if family not in _ROUTER_NAMES:
+    if family not in ROUTER_TENSORS:
         raise ValueError("the streamed writer supports the laguna and afmoe families only")
-    gate_local, bias_locals = _ROUTER_NAMES[family]
+    gate_local, bias_locals = ROUTER_TENSORS[family]
     config = build_runtime_config(family, source_config.to_dict(), plan)
 
     reader = ShardReader(source)

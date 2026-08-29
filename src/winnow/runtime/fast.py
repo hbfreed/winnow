@@ -212,14 +212,14 @@ class FastQwenMoE(FastRaggedMoE):
         return (self._routed(x, weights, experts) + shared).reshape(shape)
 
 
-class FastLagunaMoE(FastRaggedMoE):
-    """Fused Laguna block: sigmoid routing, bias-corrected selection, scaling.
+class FastSigmoidMoE(FastRaggedMoE):
+    """Fused sigmoid-routed block with a shared expert (Laguna, Afmoe).
 
     The router selects on ``sigmoid(logits) + e_score_correction_bias`` but
-    weights by the unbiased sigmoid scores, normalized over the top-k; the
-    routed output is scaled by ``routed_scaling_factor`` and the shared expert
-    is added unweighted.  Router logit softcapping is not supported (both
-    released Laguna 2.1 checkpoints ship with softcapping disabled).
+    weights by the unbiased sigmoid scores, normalized over the top-k and
+    multiplied by ``routed_scaling_factor``; the shared expert is added
+    unweighted.  Router logit softcapping is not supported (both released
+    Laguna 2.1 checkpoints ship with softcapping disabled).
     """
 
     def __init__(
@@ -239,54 +239,17 @@ class FastLagunaMoE(FastRaggedMoE):
     @torch.compiler.disable
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.shared_experts is None:
-            raise RuntimeError("the Laguna shared expert is not attached")
+            raise RuntimeError("the shared expert is not attached")
         shape = hidden_states.shape
         x = hidden_states.reshape(-1, shape[-1])
         scores = torch.sigmoid(self.gate(x).float())
         _, experts = torch.topk(scores + self.e_score_correction_bias.float(), self.top_k, dim=-1)
         weights = scores.gather(-1, experts)
         weights = weights / weights.sum(dim=-1, keepdim=True)
-        routed = self._routed(x, weights.to(x.dtype), experts)
         if self.routed_scaling_factor != 1.0:
-            routed = routed * self.routed_scaling_factor
-        return (routed + self.shared_experts(x)).reshape(shape)
-
-
-class FastAfmoeMoE(FastRaggedMoE):
-    """Fused Afmoe block: sigmoid routing, bias-corrected selection, scaling.
-
-    The router selects on ``sigmoid(logits) + expert_bias`` but weights by the
-    unbiased sigmoid scores, normalized over the top-k and multiplied by
-    ``route_scale``; the shared expert is added unweighted.
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        widths: list[int],
-        top_k: int,
-        route_scale: float = 1.0,
-        *,
-        dtype: torch.dtype | None = None,
-    ) -> None:
-        super().__init__(hidden_size, widths, top_k, dtype=dtype)
-        self.route_scale = float(route_scale)
-        self.expert_bias = nn.Parameter(torch.zeros(len(widths)), requires_grad=False)
-        self.shared_experts: nn.Module | None = None
-
-    @torch.compiler.disable
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.shared_experts is None:
-            raise RuntimeError("the Afmoe shared expert is not attached")
-        shape = hidden_states.shape
-        x = hidden_states.reshape(-1, shape[-1])
-        scores = torch.sigmoid(self.gate(x).float())
-        _, experts = torch.topk(scores + self.expert_bias.float(), self.top_k, dim=-1)
-        weights = scores.gather(-1, experts)
-        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
-        weights = weights * self.route_scale
+            weights = weights * self.routed_scaling_factor
         routed = self._routed(x, weights.to(x.dtype), experts)
         return (routed + self.shared_experts(x)).reshape(shape)
 
 
-__all__ = ["FastAfmoeMoE", "FastLagunaMoE", "FastOlmoeMoE", "FastQwenMoE", "FastRaggedMoE"]
+__all__ = ["FastOlmoeMoE", "FastQwenMoE", "FastRaggedMoE", "FastSigmoidMoE"]
