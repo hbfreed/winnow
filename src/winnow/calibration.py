@@ -24,8 +24,15 @@ def calibration_batches(
     sequence_length: int = 2048,
     batch_size: int = 1,
     seed: int = 0,
+    chat_template: bool = False,
 ) -> Iterator[torch.LongTensor]:
-    """Yield deterministic, EOS-separated token blocks from a Hub dataset."""
+    """Yield deterministic, EOS-separated token blocks from a Hub dataset.
+
+    With ``chat_template`` the ``text_field`` holds a conversation (a list of
+    ``{"role", "content"}`` messages) that is rendered through the tokenizer's
+    chat template before tokenization, so calibration matches how a post-trained
+    model sees its deployment inputs.
+    """
     if sequences <= 0:
         raise ValueError("sequences must be greater than 0")
     if sequence_length <= 0:
@@ -49,19 +56,26 @@ def calibration_batches(
         stream = stream.select_columns([text_field])
     stream = stream.shuffle(seed=seed, buffer_size=10_000)
 
+    def _render(values: list) -> list[str]:
+        if not chat_template:
+            return [str(value) for value in values]
+        # The template supplies its own special tokens, so the rendered text
+        # goes through the same add_special_tokens=False tokenization below.
+        return tokenizer.apply_chat_template(values, tokenize=False)
+
     def _encoded() -> Iterator[list[int]]:
         # Fast tokenizers only parallelize across a batch; per-document calls
         # would keep the whole calibration set single-core.
-        texts: list[str] = []
+        values: list = []
         for example in stream:
             if text_field not in example:
                 raise ValueError(f"dataset rows do not contain the field {text_field!r}")
-            texts.append(str(example[text_field]))
-            if len(texts) == 64:
-                yield from tokenizer(texts, add_special_tokens=False)["input_ids"]
-                texts = []
-        if texts:
-            yield from tokenizer(texts, add_special_tokens=False)["input_ids"]
+            values.append(example[text_field])
+            if len(values) == 64:
+                yield from tokenizer(_render(values), add_special_tokens=False)["input_ids"]
+                values = []
+        if values:
+            yield from tokenizer(_render(values), add_special_tokens=False)["input_ids"]
 
     token_buffer: list[int] = []
     rows: list[torch.Tensor] = []
@@ -71,7 +85,10 @@ def calibration_batches(
         if not token_ids:
             continue
         token_buffer.extend(token_ids)
-        token_buffer.append(eos)
+        # A chat template usually closes the conversation with EOS already;
+        # avoid stacking a second separator in that case.
+        if token_ids[-1] != eos:
+            token_buffer.append(eos)
         while len(token_buffer) >= sequence_length and produced < sequences:
             rows.append(torch.tensor(token_buffer[:sequence_length], dtype=torch.long))
             del token_buffer[:sequence_length]

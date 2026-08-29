@@ -37,6 +37,11 @@ def _add_dataset_args(parser: argparse.ArgumentParser, *, sequences: int) -> Non
     parser.add_argument("--dataset-config")
     parser.add_argument("--split", default="train")
     parser.add_argument("--text-field", default="text")
+    parser.add_argument(
+        "--chat-template",
+        action="store_true",
+        help="treat --text-field as a messages list and render the tokenizer chat template",
+    )
     parser.add_argument("--dataset-revision")
     parser.add_argument("--sequences", type=int, default=sequences)
     parser.add_argument("--sequence-length", type=int, default=2048)
@@ -181,6 +186,7 @@ def _base_metadata(
             "config": args.dataset_config,
             "split": args.split,
             "text_field": args.text_field,
+            "chat_template": args.chat_template,
             "revision": args.dataset_revision,
             "commit": _hub_sha("dataset", args.calibration, args.dataset_revision),
             "sequences": args.sequences,
@@ -233,6 +239,7 @@ def run_prune(args: argparse.Namespace) -> Path:
         sequence_length=args.sequence_length,
         batch_size=args.batch_size,
         seed=args.seed,
+        chat_template=args.chat_template,
     )
     with StatsCollector(model, adapter) as collector, torch.no_grad():
         for batch in batches:
@@ -309,6 +316,7 @@ def _collect_sequences(tokenizer, args: argparse.Namespace, total: int, skip: in
         sequence_length=args.sequence_length,
         batch_size=1,
         seed=args.seed,
+        chat_template=args.chat_template,
     )
     for batch in batches:
         rows.append(batch[0])
