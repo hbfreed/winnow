@@ -49,28 +49,67 @@ def _balanced_device_map(model: nn.Module, devices: list[str]) -> dict[str, str]
     return device_map
 
 
-def load_fast_laguna(
+def _fast_family(config, dtype: torch.dtype):
+    """Return (model_type, block_builder, gate_name, bias_name, bias_attr) for one family."""
+    family = str(config.model_type).removeprefix("winnow_")
+    if family == "laguna":
+        from .fast import FastLagunaMoE
+        from .laguna import WinnowLagunaForCausalLM
+
+        def build(widths: list[int]):
+            return FastLagunaMoE(
+                config.hidden_size,
+                widths,
+                config.num_experts_per_tok,
+                float(getattr(config, "moe_routed_scaling_factor", 1.0)),
+                dtype=dtype,
+            )
+
+        return (
+            WinnowLagunaForCausalLM,
+            build,
+            "gate.weight",
+            "gate.e_score_correction_bias",
+            "e_score_correction_bias",
+        )
+    if family == "afmoe":
+        from .afmoe import WinnowAfmoeForCausalLM
+        from .fast import FastAfmoeMoE
+
+        def build(widths: list[int]):
+            return FastAfmoeMoE(
+                config.hidden_size,
+                widths,
+                config.num_experts_per_tok,
+                float(getattr(config, "route_scale", 1.0)),
+                dtype=dtype,
+            )
+
+        return (WinnowAfmoeForCausalLM, build, "router.gate.weight", "expert_bias", "expert_bias")
+    raise ValueError(f"the fused loader supports laguna and afmoe, not {config.model_type!r}")
+
+
+def _load_fast(
     checkpoint: str | Path,
     *,
+    family: str,
     int8: bool = True,
     devices: list[str] | None = None,
     dtype: torch.dtype = torch.bfloat16,
 ) -> nn.Module:
-    """Build a pruned Laguna model on the fused runtime, ready to generate."""
     from accelerate import dispatch_model, init_empty_weights
 
     from ..stream import ShardReader, _sparse_positions, load_config
-    from .fast import FastLagunaMoE
-    from .laguna import WinnowLagunaForCausalLM
 
     checkpoint = Path(checkpoint)
     config = load_config(checkpoint)
-    if config.model_type not in ("winnow_laguna", "laguna"):
-        raise ValueError(f"expected a (pruned) Laguna checkpoint, got {config.model_type!r}")
+    if config.model_type not in (f"winnow_{family}", family):
+        raise ValueError(f"expected a (pruned) {family} checkpoint, got {config.model_type!r}")
+    model_type, build_block, gate_name, bias_name, bias_attr = _fast_family(config, dtype)
     if getattr(config, "expert_widths", None) is None:
         raise ValueError("the fused loader expects a Winnow-pruned checkpoint")
     with init_empty_weights(include_buffers=False):
-        model = WinnowLagunaForCausalLM(config)
+        model = model_type(config)
 
     reader = ShardReader(checkpoint)
     positions = _sparse_positions(config)
@@ -82,20 +121,14 @@ def load_fast_laguna(
         prefix = f"model.layers.{layer_idx}.mlp.experts."
         consumed_prefixes.append(prefix)
         widths = list(config.expert_widths[positions[layer_idx]])
-        fast = FastLagunaMoE(
-            config.hidden_size,
-            widths,
-            config.num_experts_per_tok,
-            float(getattr(config, "moe_routed_scaling_factor", 1.0)),
-            dtype=dtype,
-        )
+        fast = build_block(widths)
         with torch.no_grad():
             fast.gate.weight = nn.Parameter(
-                reader.get(f"model.layers.{layer_idx}.mlp.gate.weight").to(dtype),
+                reader.get(f"model.layers.{layer_idx}.mlp.{gate_name}").to(dtype),
                 requires_grad=False,
             )
-            fast.e_score_correction_bias.data = reader.get(
-                f"model.layers.{layer_idx}.mlp.gate.e_score_correction_bias"
+            getattr(fast, bias_attr).data = reader.get(
+                f"model.layers.{layer_idx}.mlp.{bias_name}"
             ).float()
             for slot, width in enumerate(widths):
                 gate_up = reader.get(f"{prefix}gate_up_projs.{slot}").to(dtype)
@@ -117,7 +150,7 @@ def load_fast_laguna(
     for name in reader.names:
         if any(name.startswith(prefix) for prefix in consumed_prefixes):
             continue
-        if name.endswith((".mlp.gate.weight", ".mlp.gate.e_score_correction_bias")):
+        if name.endswith((f".mlp.{gate_name}", f".mlp.{bias_name}")):
             continue
         target = name.replace(".mlp.shared_expert.", ".mlp.shared_experts.")
         state[target] = reader.get(name).to(dtype)
@@ -142,4 +175,26 @@ def load_fast_laguna(
     return dispatch_model(model, device_map=device_map)
 
 
-__all__ = ["load_fast_laguna"]
+def load_fast_laguna(
+    checkpoint: str | Path,
+    *,
+    int8: bool = True,
+    devices: list[str] | None = None,
+    dtype: torch.dtype = torch.bfloat16,
+) -> nn.Module:
+    """Build a pruned Laguna model on the fused runtime, ready to generate."""
+    return _load_fast(checkpoint, family="laguna", int8=int8, devices=devices, dtype=dtype)
+
+
+def load_fast_afmoe(
+    checkpoint: str | Path,
+    *,
+    int8: bool = True,
+    devices: list[str] | None = None,
+    dtype: torch.dtype = torch.bfloat16,
+) -> nn.Module:
+    """Build a pruned Afmoe (Arcee Trinity) model on the fused runtime."""
+    return _load_fast(checkpoint, family="afmoe", int8=int8, devices=devices, dtype=dtype)
+
+
+__all__ = ["load_fast_afmoe", "load_fast_laguna"]
