@@ -42,4 +42,5 @@ The output contains `winnow.json`. This file records the source model, the
 calibration data, the score, and the pruning plan.
 
 The optional fused runtime uses the
-[`megablocks-variable`](https://github.com/hbfreed/megablocks-variable) fork.
+independent [`megablocks-variable`](https://github.com/hbfreed/megablocks-variable)
+project.
