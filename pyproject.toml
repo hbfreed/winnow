@@ -18,7 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
 fast = [
-    "megablocks @ git+https://github.com/hbfreed/megablocks-variable.git@c6faf01db806f2f9c790ac37c9a2a5f8b5ee893d",
+    "megablocks @ git+https://github.com/hbfreed/megablocks-variable.git@eaa050001397ea23557909a0e202643caa39942c",
 ]
 dev = [
     "build>=1.3,<2",

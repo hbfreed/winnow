@@ -769,7 +769,7 @@ wheels = [
 [[package]]
 name = "megablocks"
 version = "0.11.0.dev0"
-source = { git = "https://github.com/hbfreed/megablocks-variable.git?rev=c6faf01db806f2f9c790ac37c9a2a5f8b5ee893d#c6faf01db806f2f9c790ac37c9a2a5f8b5ee893d" }
+source = { git = "https://github.com/hbfreed/megablocks-variable.git?rev=eaa050001397ea23557909a0e202643caa39942c#eaa050001397ea23557909a0e202643caa39942c" }
 dependencies = [
     { name = "einops" },
     { name = "numpy" },
@@ -807,7 +807,7 @@ requires-dist = [
     { name = "build", marker = "extra == 'dev'", specifier = ">=1.3,<2" },
     { name = "datasets", specifier = ">=4,<6" },
     { name = "huggingface-hub", specifier = ">=0.36,<2" },
-    { name = "megablocks", marker = "extra == 'fast'", git = "https://github.com/hbfreed/megablocks-variable.git?rev=c6faf01db806f2f9c790ac37c9a2a5f8b5ee893d" },
+    { name = "megablocks", marker = "extra == 'fast'", git = "https://github.com/hbfreed/megablocks-variable.git?rev=eaa050001397ea23557909a0e202643caa39942c" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8,<10" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.12,<1" },
     { name = "safetensors", specifier = ">=0.5,<1" },
