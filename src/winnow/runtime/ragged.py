@@ -52,19 +52,34 @@ def install_ragged_experts(
     replace (including ``meta``), and a sigmoid-router correction bias is
     resized when the gate has one.
     """
-    if len(widths) < block.gate.top_k:
+    # Absolute import: transformers' remote-code scanner follows relative
+    # imports when copying shim modules and cannot climb out of the package.
+    from winnow.adapters import block_router
+
+    router = block_router(block)
+    if len(widths) < router.top_k:
         raise ValueError("each layer must keep at least the router top-k experts")
     if any(width <= 0 for width in widths):
         raise ValueError("expert widths must be greater than 0")
-    old_weight = block.gate.weight
-    block.gate.num_experts = len(widths)
-    block.gate.weight = nn.Parameter(
+    # Afmoe nests the routing weight in an ``nn.Linear`` at ``router.gate``.
+    target = router if hasattr(router, "weight") else router.gate
+    old_weight = target.weight
+    router.num_experts = len(widths)
+    target.weight = nn.Parameter(
         torch.empty(len(widths), hidden_size, dtype=old_weight.dtype, device=old_weight.device)
     )
-    bias = getattr(block.gate, "e_score_correction_bias", None)
+    if isinstance(target, nn.Linear):
+        target.out_features = len(widths)
+    bias = getattr(router, "e_score_correction_bias", None)
     if bias is not None:
-        block.gate.e_score_correction_bias = nn.Parameter(
+        router.e_score_correction_bias = nn.Parameter(
             torch.empty(len(widths), dtype=bias.dtype, device=bias.device),
+            requires_grad=False,
+        )
+    block_bias = getattr(block, "expert_bias", None)
+    if block_bias is not None:
+        block.expert_bias = nn.Parameter(
+            torch.empty(len(widths), dtype=block_bias.dtype, device=block_bias.device),
             requires_grad=False,
         )
     with torch.device(old_weight.device):

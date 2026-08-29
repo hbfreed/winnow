@@ -25,16 +25,22 @@ def _direct_perplexity(model, sequences: torch.Tensor) -> float:
     return math.exp(float(loss))
 
 
-def test_stream_matches_full_forward(tmp_path, tiny_laguna):
+@pytest.fixture(params=["tiny_laguna", "tiny_afmoe"])
+def tiny_streamable(request):
+    return request.getfixturevalue(request.param)
+
+
+def test_stream_matches_full_forward(tmp_path, tiny_streamable):
+    model = tiny_streamable
     sequences = _sequences()
     calibration = sequences[:4]
     held_out = sequences[4:]
     source_dir = tmp_path / "src"
-    tiny_laguna.save_pretrained(source_dir)
+    model.save_pretrained(source_dir)
 
-    with StatsCollector(tiny_laguna) as collector, torch.no_grad():
-        tiny_laguna(calibration, use_cache=False)
-    expected_ppl = _direct_perplexity(tiny_laguna, held_out)
+    with StatsCollector(model) as collector, torch.no_grad():
+        model(calibration, use_cache=False)
+    expected_ppl = _direct_perplexity(model, held_out)
 
     result = stream_run(
         source_dir,
@@ -63,15 +69,16 @@ def test_stream_matches_full_forward(tmp_path, tiny_laguna):
     assert result["perplexity"] == pytest.approx(expected_ppl, rel=1e-3)
 
 
-def test_stream_pruned_checkpoint_perplexity(tmp_path, tiny_laguna):
+def test_stream_pruned_checkpoint_perplexity(tmp_path, tiny_streamable):
+    model = tiny_streamable
     sequences = _sequences()
     source_dir = tmp_path / "src"
-    tiny_laguna.save_pretrained(source_dir)
+    model.save_pretrained(source_dir)
 
     scores = torch.ones(2, 4, 8)
     plan = select_channels(scores, 1.0, top_k=2, layer_indices=(1, 2))
     pruned_dir = tmp_path / "pruned"
-    save_checkpoint(tiny_laguna, plan, pruned_dir, metadata={"test": True})
+    save_checkpoint(model, plan, pruned_dir, metadata={"test": True})
 
     kwargs = {
         "calibration_sequences": 0,
@@ -85,20 +92,21 @@ def test_stream_pruned_checkpoint_perplexity(tmp_path, tiny_laguna):
     assert pruned["perplexity"] == pytest.approx(base["perplexity"], rel=1e-4)
 
 
-def test_streamed_writer_matches_in_memory_writer(tmp_path, tiny_laguna, input_ids):
+def test_streamed_writer_matches_in_memory_writer(tmp_path, tiny_streamable, input_ids):
     from transformers import AutoModelForCausalLM
 
     from winnow.checkpoint import save_checkpoint_streamed
     from winnow.stream import ShardReader
 
+    model = tiny_streamable
     source_dir = tmp_path / "src"
-    tiny_laguna.save_pretrained(source_dir)
+    model.save_pretrained(source_dir)
 
     scores = torch.arange(64, dtype=torch.float32).reshape(2, 4, 8)
     plan = select_channels(scores, 0.5, top_k=2, layer_indices=(1, 2))
     memory_dir = tmp_path / "memory"
     streamed_dir = tmp_path / "streamed"
-    save_checkpoint(tiny_laguna, plan, memory_dir, metadata={"test": True})
+    save_checkpoint(model, plan, memory_dir, metadata={"test": True})
     save_checkpoint_streamed(source_dir, plan, streamed_dir, metadata={"test": True})
 
     memory = ShardReader(memory_dir)

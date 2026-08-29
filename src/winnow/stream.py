@@ -1,8 +1,8 @@
 """Layer-streaming calibration and evaluation for models larger than memory.
 
-The streamed path currently supports the Laguna family only: layers are
-rebuilt with ``LagunaDecoderLayer``, so other families must go through the
-in-memory ``prune`` path.
+The streamed path currently supports the Laguna and Afmoe families only:
+layers are rebuilt with the family's decoder layer class, so other families
+must go through the in-memory ``prune`` path.
 
 The streamed pass never holds more than one decoder layer of weights per
 device.  The residual stream for every calibration sequence is kept in two
@@ -55,6 +55,7 @@ def load_config(checkpoint: str | Path):
         by_model_type = {
             cls.model_type: cls
             for cls in (
+                runtime.WinnowAfmoeConfig,
                 runtime.WinnowLagunaConfig,
                 runtime.WinnowOlmoeConfig,
                 runtime.WinnowQwen3_5MoeConfig,
@@ -123,10 +124,42 @@ class ShardReader:
 # Layer materialization
 
 
+def _family(config) -> str:
+    """Return the streamed model family for a source or Winnow config."""
+    family = str(config.model_type).removeprefix("winnow_")
+    if family not in ("laguna", "afmoe"):
+        raise ValueError(f"the streamed path supports laguna and afmoe, not {family!r}")
+    return family
+
+
+def _family_modeling(config):
+    """Return the transformers modeling module for the config's family."""
+    if _family(config) == "afmoe":
+        from transformers.models.afmoe import modeling_afmoe
+
+        return modeling_afmoe
+    from transformers.models.laguna import modeling_laguna
+
+    return modeling_laguna
+
+
+def _family_class(config, suffix: str):
+    modeling = _family_modeling(config)
+    prefix = "Afmoe" if _family(config) == "afmoe" else "Laguna"
+    return getattr(modeling, f"{prefix}{suffix}")
+
+
 def _sparse_positions(config) -> dict[int, int]:
     """Map decoder layer index -> ordinal position among sparse layers."""
+    kinds = getattr(config, "mlp_layer_types", None)
+    if kinds is None:
+        # Afmoe: the first ``num_dense_layers`` layers are dense, the rest MoE.
+        dense = int(config.num_dense_layers)
+        kinds = [
+            "dense" if index < dense else "sparse" for index in range(config.num_hidden_layers)
+        ]
     positions = {}
-    for layer_idx, kind in enumerate(config.mlp_layer_types):
+    for layer_idx, kind in enumerate(kinds):
         if kind == "sparse":
             positions[layer_idx] = len(positions)
     return positions
@@ -198,10 +231,10 @@ def materialize_layer(
     names: list[str] | None = None,
 ) -> nn.Module:
     """Load one decoder layer's weights onto ``device`` and return the module."""
-    from transformers.models.laguna.modeling_laguna import LagunaDecoderLayer
+    decoder_layer_type = _family_class(config, "DecoderLayer")
 
     with torch.device("meta"):
-        layer = LagunaDecoderLayer(config, layer_idx)
+        layer = decoder_layer_type(config, layer_idx)
 
     widths_table = getattr(config, "expert_widths", None)
     if widths_table is not None and hasattr(layer.mlp, "experts"):
@@ -269,14 +302,18 @@ def _layer_inputs(config, device: str, dtype: torch.dtype, batch: torch.Tensor):
         create_causal_mask,
         create_sliding_window_causal_mask,
     )
-    from transformers.models.laguna.modeling_laguna import LagunaRotaryEmbedding
 
     position_ids = torch.arange(batch.shape[1], device=device).unsqueeze(0)
-    rotary = LagunaRotaryEmbedding(config).to(device)
+    rotary = _family_class(config, "RotaryEmbedding")(config).to(device)
     layer_types = set(config.layer_types)
-    position_embeddings = {
-        layer_type: rotary(batch, position_ids, layer_type) for layer_type in layer_types
-    }
+    if _family(config) == "afmoe":
+        # Afmoe shares one rotary embedding across every layer type.
+        shared = rotary(batch, position_ids)
+        position_embeddings = {layer_type: shared for layer_type in layer_types}
+    else:
+        position_embeddings = {
+            layer_type: rotary(batch, position_ids, layer_type) for layer_type in layer_types
+        }
     mask_kwargs = {
         "config": config,
         "inputs_embeds": batch,
@@ -320,7 +357,7 @@ def run_rank_sweep(
         if getattr(config, "expert_widths", None) is not None:
             raise ValueError("score collection expects the unpruned source checkpoint")
         adapter = ModelAdapter(
-            family="laguna",
+            family=_family(config),
             layers=tuple((index, None) for index in sorted(positions)),
             original_experts=config.num_experts,
             original_width=config.moe_intermediate_size,
@@ -379,10 +416,10 @@ def run_rank_sweep(
         loss_sum = 0.0
         loss_tokens = 0
         if rank_data.eval_sequences:
-            from transformers.models.laguna.modeling_laguna import LagunaRMSNorm
+            norm_type = _family_class(config, "RMSNorm")
 
             with torch.device("meta"):
-                norm = LagunaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                norm = norm_type(config.hidden_size, eps=config.rms_norm_eps)
             norm.load_state_dict(
                 {"weight": reader.get("model.norm.weight", device).to(dtype)},
                 strict=True,
@@ -427,6 +464,10 @@ def _write_rank_shards(
     reader = ShardReader(checkpoint)
     embeddings = reader.get("model.embed_tokens.weight")
     reader.close()
+    if getattr(config, "mup_enabled", False):
+        # Afmoe scales the embedding output inside the model forward; the
+        # streamed pass feeds layer inputs directly, so scale here instead.
+        embeddings = embeddings * math.sqrt(config.hidden_size)
 
     eval_sequences = sequences.shape[0] - calibration_sequences
 

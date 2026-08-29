@@ -7,6 +7,8 @@ os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
 import pytest
 import torch
 from transformers import OlmoeConfig, OlmoeForCausalLM
+from transformers.models.afmoe.configuration_afmoe import AfmoeConfig
+from transformers.models.afmoe.modeling_afmoe import AfmoeForCausalLM
 from transformers.models.laguna.configuration_laguna import LagunaConfig
 from transformers.models.laguna.modeling_laguna import LagunaForCausalLM
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
@@ -63,6 +65,42 @@ def tiny_qwen():
         pad_token_id=0,
     )
     return Qwen3_5MoeForCausalLM(config).eval()
+
+
+@pytest.fixture()
+def tiny_afmoe():
+    torch.manual_seed(0)
+    config = AfmoeConfig(
+        vocab_size=64,
+        hidden_size=16,
+        intermediate_size=32,
+        moe_intermediate_size=8,
+        num_hidden_layers=3,
+        num_dense_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        max_position_embeddings=32,
+        layer_types=["full_attention", "sliding_attention", "full_attention"],
+        sliding_window=4,
+        num_experts=4,
+        num_experts_per_tok=2,
+        num_shared_experts=1,
+        route_scale=2.5,
+        mup_enabled=True,
+        eos_token_id=2,
+        pad_token_id=0,
+    )
+    model = AfmoeForCausalLM(config).eval()
+    # Give the aux-loss-free routing bias real values so a checkpoint test that
+    # mishandles its slicing changes the routing and fails the parity check.
+    with torch.no_grad():
+        generator = torch.Generator().manual_seed(7)
+        for layer in model.model.layers:
+            bias = getattr(layer.mlp, "expert_bias", None)
+            if bias is not None:
+                bias.copy_(torch.rand(bias.shape, generator=generator) * 0.2)
+    return model
 
 
 @pytest.fixture()

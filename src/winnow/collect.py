@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.hooks import RemovableHandle
 
-from .adapters import ModelAdapter, adapter_for
+from .adapters import ModelAdapter, adapter_for, block_router
 from .runtime.ragged import routed_token_segments
 
 
@@ -153,7 +153,7 @@ class StatsCollector:
         the block is discarded; they are also tracked for ``detach``.
         """
         handles = [
-            block.gate.register_forward_hook(self._gate_hook(position)),
+            block_router(block).register_forward_hook(self._gate_hook(position)),
             block.experts.register_forward_hook(self._experts_hook(position), with_kwargs=True),
         ]
         act_fn = block.experts.act_fn

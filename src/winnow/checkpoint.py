@@ -13,9 +13,11 @@ import torch
 from accelerate import init_empty_weights
 from torch import nn
 
-from .adapters import adapter_for
+from .adapters import adapter_for, block_router
 from .plan import PruningPlan
 from .runtime import (
+    WinnowAfmoeConfig,
+    WinnowAfmoeForCausalLM,
     WinnowLagunaConfig,
     WinnowLagunaForCausalLM,
     WinnowOlmoeConfig,
@@ -38,6 +40,15 @@ FAMILIES = {
     "olmoe": (WinnowOlmoeConfig, WinnowOlmoeForCausalLM),
     "qwen3_5_moe": (WinnowQwen3_5MoeConfig, WinnowQwen3_5MoeForCausalLM),
     "laguna": (WinnowLagunaConfig, WinnowLagunaForCausalLM),
+    "afmoe": (WinnowAfmoeConfig, WinnowAfmoeForCausalLM),
+}
+
+# Per-family router tensor names, relative to one decoder layer's ``mlp``:
+# the routing weight and the aux-loss-free selection bias candidates in
+# checkpoint order of preference (the first name is the one written).
+_ROUTER_NAMES = {
+    "laguna": ("gate.weight", ("gate.e_score_correction_bias", "experts.e_score_correction_bias")),
+    "afmoe": ("router.gate.weight", ("expert_bias",)),
 }
 
 
@@ -76,17 +87,23 @@ def extract_state(model: nn.Module, plan: PruningPlan) -> dict[str, torch.Tensor
         for layer_plan in plan.layers:
             block = blocks[layer_plan.layer]
             source = block.experts
+            router = block_router(block)
+            weight = router.weight if hasattr(router, "weight") else router.gate.weight
+            weight_name, bias_names = _ROUTER_NAMES.get(adapter.family, ("gate.weight", ()))
             survivor_tensor = torch.tensor(
-                layer_plan.experts, dtype=torch.long, device=block.gate.weight.device
+                layer_plan.experts, dtype=torch.long, device=weight.device
             )
-            state[f"model.layers.{layer_plan.layer}.mlp.gate.weight"] = (
-                block.gate.weight.index_select(0, survivor_tensor).contiguous()
-            )
-            bias = getattr(block.gate, "e_score_correction_bias", None)
-            if bias is not None:
-                state[f"model.layers.{layer_plan.layer}.mlp.gate.e_score_correction_bias"] = (
-                    bias.index_select(0, survivor_tensor.to(bias.device)).contiguous()
-                )
+            state[f"model.layers.{layer_plan.layer}.mlp.{weight_name}"] = weight.index_select(
+                0, survivor_tensor
+            ).contiguous()
+            if bias_names:
+                bias = getattr(router, "e_score_correction_bias", None)
+                if bias is None:
+                    bias = getattr(block, "expert_bias", None)
+                if bias is not None:
+                    state[f"model.layers.{layer_plan.layer}.mlp.{bias_names[0]}"] = (
+                        bias.index_select(0, survivor_tensor.to(bias.device)).contiguous()
+                    )
             for slot, (expert, channels) in enumerate(
                 zip(layer_plan.experts, layer_plan.channels, strict=True)
             ):
@@ -251,9 +268,10 @@ def save_checkpoint_streamed(
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     source_config = load_config(source)
-    if source_config.model_type != "laguna":
-        raise ValueError("the streamed writer currently supports the laguna family only")
-    family = "laguna"
+    family = str(source_config.model_type)
+    if family not in _ROUTER_NAMES:
+        raise ValueError("the streamed writer supports the laguna and afmoe families only")
+    gate_local, bias_locals = _ROUTER_NAMES[family]
     config = build_runtime_config(family, source_config.to_dict(), plan)
 
     reader = ShardReader(source)
@@ -285,12 +303,9 @@ def save_checkpoint_streamed(
             continue
 
         survivors = torch.tensor(layer_plan.experts, dtype=torch.long)
-        gate_weight = reader.get(f"{prefix}mlp.gate.weight")
-        writer.add(f"{prefix}mlp.gate.weight", gate_weight.index_select(0, survivors))
-        bias_names = (
-            f"{prefix}mlp.gate.e_score_correction_bias",
-            f"{prefix}mlp.experts.e_score_correction_bias",
-        )
+        gate_weight = reader.get(f"{prefix}mlp.{gate_local}")
+        writer.add(f"{prefix}mlp.{gate_local}", gate_weight.index_select(0, survivors))
+        bias_names = tuple(f"{prefix}mlp.{local}" for local in bias_locals)
         bias = next(
             (reader.get(name) for name in bias_names if name in reader.index),
             torch.zeros(plan.original_experts, dtype=gate_weight.dtype),
@@ -325,12 +340,10 @@ def save_checkpoint_streamed(
             writer.add(f"{prefix}mlp.experts.gate_up_projs.{slot}", gate_up)
             writer.add(f"{prefix}mlp.experts.down_projs.{slot}", down)
 
-        consumed_suffixes = (
-            ".mlp.gate.weight",
-            ".e_score_correction_bias",
-        )
+        consumed = {f"mlp.{local}" for local in (gate_local, *bias_locals)}
         for name in names:
-            if ".mlp.experts." in name or name.endswith(consumed_suffixes):
+            local = name.removeprefix(prefix)
+            if ".mlp.experts." in name or local in consumed:
                 continue
             writer.add(_rename(name), reader.get(name))
 
