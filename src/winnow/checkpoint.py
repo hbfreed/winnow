@@ -346,5 +346,8 @@ def save_checkpoint_streamed(
     writer.finalize()
     reader.close()
     config.save_pretrained(output)
+    generation_config = source / "generation_config.json"
+    if generation_config.exists():
+        shutil.copyfile(generation_config, output / generation_config.name)
     _write_support_files(output, family, plan, metadata, tokenizer)
     return output
