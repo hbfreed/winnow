@@ -63,3 +63,30 @@ def test_fast_olmoe_matches_reference_math():
 
     relative_error = (actual.float() - expected).norm() / expected.norm()
     assert relative_error < 5e-3
+
+
+def test_quantize_at_load_matches_post_hoc_quantization():
+    from winnow.runtime.fast import FastSigmoidMoE
+
+    generator = torch.Generator().manual_seed(21)
+    widths = [128, 256]
+    slabs = {
+        (expert, kind): torch.randn(shape, generator=generator, dtype=torch.bfloat16)
+        for expert, width in enumerate(widths)
+        for kind, shape in (
+            ("gate", (width, 128)),
+            ("up", (width, 128)),
+            ("down", (128, width)),
+        )
+    }
+    post_hoc = FastSigmoidMoE(128, widths, 1, dtype=torch.bfloat16)
+    at_load = FastSigmoidMoE(128, widths, 1, quantize_w8a16=True)
+    assert at_load.is_int8  # int8 buffers exist before any weight loads
+    for (expert, kind), weight in slabs.items():
+        post_hoc.load_expert_weight_(expert, kind, weight)
+        at_load.load_expert_weight_(expert, kind, weight)
+    post_hoc.quantize_int8_()
+    for name in ("w_gate", "w_up", "w_down", "w_gate_scale", "w_up_scale", "w_down_scale"):
+        torch.testing.assert_close(
+            getattr(at_load, name), getattr(post_hoc, name), rtol=0, atol=0
+        )

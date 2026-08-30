@@ -21,6 +21,7 @@ class FastRaggedMoE(nn.Module):
         *,
         dtype: torch.dtype | None = None,
         block_size: int | None = None,
+        quantize_w8a16: bool = False,
     ) -> None:
         super().__init__()
         if block_size is not None:
@@ -37,9 +38,22 @@ class FastRaggedMoE(nn.Module):
         self.top_k = int(top_k)
         self.total_width = sum(self.expert_widths)
         self.gate = nn.Linear(hidden_size, self.num_experts, bias=False, dtype=dtype)
-        self.w_gate = nn.Parameter(torch.empty(hidden_size, self.total_width, dtype=dtype))
-        self.w_up = nn.Parameter(torch.empty(hidden_size, self.total_width, dtype=dtype))
-        self.w_down = nn.Parameter(torch.empty(self.total_width, hidden_size, dtype=dtype))
+        if quantize_w8a16:
+            # Allocate the packed weights as INT8 up front so a model too
+            # large for BF16 residency never materializes; each expert slab
+            # quantizes as it loads.
+            self.register_buffer("w_gate", torch.zeros(hidden_size, self.total_width, dtype=torch.int8))
+            self.register_buffer("w_up", torch.zeros(hidden_size, self.total_width, dtype=torch.int8))
+            self.register_buffer("w_down", torch.zeros(self.total_width, hidden_size, dtype=torch.int8))
+            self.register_buffer("w_gate_scale", torch.ones(self.total_width, dtype=torch.float32))
+            self.register_buffer("w_up_scale", torch.ones(self.total_width, dtype=torch.float32))
+            self.register_buffer(
+                "w_down_scale", torch.ones(self.num_experts, hidden_size, dtype=torch.float32)
+            )
+        else:
+            self.w_gate = nn.Parameter(torch.empty(hidden_size, self.total_width, dtype=dtype))
+            self.w_up = nn.Parameter(torch.empty(hidden_size, self.total_width, dtype=dtype))
+            self.w_down = nn.Parameter(torch.empty(self.total_width, hidden_size, dtype=dtype))
         self._plan_cache: FusedMoEPlan | None = None
 
     def _offset(self, expert: int) -> int:
@@ -61,6 +75,23 @@ class FastRaggedMoE(nn.Module):
                 f"expected {expected}"
             )
         offset = self._offset(expert)
+        if self.is_int8:
+            # Per-expert online quantization: gate/up scales are per packed
+            # output column and down scales per (expert, hidden channel), so
+            # one expert's slab quantizes independently of the others.
+            packed = checkpoint_weight.to(self.w_gate.device).t().contiguous()
+            if projection == "down":
+                scale = packed.abs().amax(dim=0).float().clamp_min(1e-8) / 127.0
+                self.w_down[offset : offset + width] = (
+                    torch.round(packed.float() / scale).clamp_(-127, 127).to(torch.int8)
+                )
+                self.w_down_scale[expert] = scale
+            else:
+                scale = packed.abs().amax(dim=0).float().clamp_min(1e-8) / 127.0
+                quantized = torch.round(packed.float() / scale).clamp_(-127, 127).to(torch.int8)
+                getattr(self, f"w_{projection}")[:, offset : offset + width] = quantized
+                getattr(self, f"w_{projection}_scale")[offset : offset + width] = scale
+            return f"w_{projection}"
         destination = (
             self.w_down.data[offset : offset + width]
             if projection == "down"
@@ -230,8 +261,9 @@ class FastSigmoidMoE(FastRaggedMoE):
         routed_scaling_factor: float = 1.0,
         *,
         dtype: torch.dtype | None = None,
+        quantize_w8a16: bool = False,
     ) -> None:
-        super().__init__(hidden_size, widths, top_k, dtype=dtype)
+        super().__init__(hidden_size, widths, top_k, dtype=dtype, quantize_w8a16=quantize_w8a16)
         self.routed_scaling_factor = float(routed_scaling_factor)
         self.e_score_correction_bias = nn.Parameter(torch.zeros(len(widths)), requires_grad=False)
         self.shared_experts: nn.Module | None = None
